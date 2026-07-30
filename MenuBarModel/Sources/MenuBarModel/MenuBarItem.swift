@@ -7,6 +7,7 @@
 //  Licensed under the GNU GPLv3
 
 import Cocoa
+import os
 import os.lock
 
 /// A structural representation of a menu bar item.
@@ -508,7 +509,7 @@ extension MenuBarItemTag.Namespace {
             return cached.values
         }
 
-        var values = Set<String>()
+        var collected = Set<String>()
         if let dict = UserDefaults(suiteName: "com.apple.MenuBarAgent")?
             .dictionary(forKey: "TrailingItemPreferredPositions")
         {
@@ -516,11 +517,12 @@ extension MenuBarItemTag.Namespace {
             for key in dict.keys where key.hasPrefix(prefix) {
                 let body = key.dropFirst(prefix.count)
                 if let separator = body.range(of: "::") {
-                    values.insert(String(body[body.startIndex ..< separator.lowerBound]))
+                    collected.insert(String(body[body.startIndex ..< separator.lowerBound]))
                 }
             }
         }
 
+        let values = collected
         systemNamespaceCache.withLock { $0 = (now, values) }
         return values
     }
@@ -536,8 +538,14 @@ extension MenuBarItemTag.Namespace {
         let names = candidates.compactMap { $0 }.filter { !$0.isEmpty }
         let known = systemStatusNamespaces
         if !known.isEmpty, let match = names.first(where: { known.contains($0) }) {
+            if match != names.first {
+                Logger(subsystem: "com.stonerl.Thaw", category: "NamespaceReconcile")
+                    .info("RECONCILED \(names.first ?? "-", privacy: .public) -> \(match, privacy: .public)")
+            }
             return .string(match)
         }
+        Logger(subsystem: "com.stonerl.Thaw", category: "NamespaceReconcile")
+            .info("NOMATCH candidates=\(names.joined(separator: "|"), privacy: .public) knownCount=\(known.count, privacy: .public)")
         return .optional(names.first)
     }
 
