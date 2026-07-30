@@ -481,6 +481,66 @@ extension MenuBarItemTag.Namespace {
         uuidCache.withLock { $0 = $0.filter { validWindowIDs.contains($0.key) } }
     }
 
+    private static let systemNamespaceCache = OSAllocatedUnfairLock<(stamp: Date, values: Set<String>)?>(initialState: nil)
+
+    /// The namespaces the system is currently filing status items under.
+    ///
+    /// macOS 27 records every status item's position in a single dictionary,
+    /// `TrailingItemPreferredPositions` in `com.apple.MenuBarAgent`, keyed as
+    /// `status:<namespace>::<autosaveName>`.
+    ///
+    /// For most apps `<namespace>` is the bundle identifier, but MenuBarAgent
+    /// falls back to the process name for helpers whose bundle it cannot
+    /// resolve. iStat Menus is the notable case: its menu bar helper lives in
+    /// `~/Library/Application Support/iStat Menus 7/`, and the system files its
+    /// items under `iStat Menus Menubar`, not `com.bjango.istatmenus.status`.
+    /// `NSRunningApplication` *does* resolve the bundle ID for that process, so
+    /// preferring it unconditionally builds a key the system never uses. The
+    /// preferred-position write then misses silently and the move falls through
+    /// to the synthetic drag path, which is hit-tested by cursor location and
+    /// is the source of the flicker, reordering, and vanishing items.
+    ///
+    /// Read fresh at most every two seconds; item lists are rebuilt far more
+    /// often than the system rewrites this dictionary.
+    static var systemStatusNamespaces: Set<String> {
+        let now = Date()
+        if let cached = systemNamespaceCache.withLock({ $0 }), now.timeIntervalSince(cached.stamp) < 2 {
+            return cached.values
+        }
+
+        var values = Set<String>()
+        if let dict = UserDefaults(suiteName: "com.apple.MenuBarAgent")?
+            .dictionary(forKey: "TrailingItemPreferredPositions")
+        {
+            let prefix = "status:"
+            for key in dict.keys where key.hasPrefix(prefix) {
+                let body = key.dropFirst(prefix.count)
+                if let separator = body.range(of: "::") {
+                    values.insert(String(body[body.startIndex ..< separator.lowerBound]))
+                }
+            }
+        }
+
+        systemNamespaceCache.withLock { $0 = (now, values) }
+        return values
+    }
+
+    /// Returns the first candidate the system already recognizes as a
+    /// namespace, falling back to the first non-empty candidate when none
+    /// match.
+    ///
+    /// This keeps the existing bundle-ID-first preference for every app the
+    /// system agrees with, and only diverges where the system has demonstrably
+    /// filed an app under a different name.
+    static func reconciled(_ candidates: [String?]) -> MenuBarItemTag.Namespace {
+        let names = candidates.compactMap { $0 }.filter { !$0.isEmpty }
+        let known = systemStatusNamespaces
+        if !known.isEmpty, let match = names.first(where: { known.contains($0) }) {
+            return .string(match)
+        }
+        return .optional(names.first)
+    }
+
     /// Creates a namespace without checks.
     ///
     /// This initializer does not perform validity checks on its parameters.
@@ -495,7 +555,7 @@ extension MenuBarItemTag.Namespace {
         // name seems less likely to change, so let's prefer it as a (somewhat)
         // stable identifier.
         if let app = itemWindow.owningApplication {
-            self = .optional(app.bundleIdentifier ?? itemWindow.ownerName ?? app.localizedName)
+            self = .reconciled([app.bundleIdentifier, itemWindow.ownerName, app.localizedName])
         } else {
             self = .optional(itemWindow.ownerName)
         }
@@ -524,12 +584,12 @@ extension MenuBarItemTag.Namespace {
         // that don't. We should also be able to handle daemons and helpers,
         // which are more likely not to have a bundle ID.
         if let sourcePID, let app = NSRunningApplication(processIdentifier: sourcePID) {
-            self = .optional(app.bundleIdentifier ?? app.localizedName)
+            self = .reconciled([app.bundleIdentifier, itemWindow.ownerName, app.localizedName])
         } else if let app = itemWindow.owningApplication {
             // Fallback: use the owning application's bundle ID or name.
             // This covers cases where the source PID doesn't resolve
             // (e.g. helper processes) but the owner is known.
-            self = .optional(app.bundleIdentifier ?? itemWindow.ownerName ?? app.localizedName)
+            self = .reconciled([app.bundleIdentifier, itemWindow.ownerName, app.localizedName])
         } else if let ownerName = itemWindow.ownerName {
             // Last resort: use the process name as a stable identifier.
             self = .string(ownerName)
