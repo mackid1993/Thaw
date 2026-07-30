@@ -503,7 +503,7 @@ extension MenuBarItemTag.Namespace {
     ///
     /// Read fresh at most every two seconds; item lists are rebuilt far more
     /// often than the system rewrites this dictionary.
-    static var systemStatusNamespaces: Set<String> {
+    public static var systemStatusNamespaces: Set<String> {
         let now = Date()
         if let cached = systemNamespaceCache.withLock({ $0 }), now.timeIntervalSince(cached.stamp) < 2 {
             return cached.values
@@ -534,7 +534,7 @@ extension MenuBarItemTag.Namespace {
     /// This keeps the existing bundle-ID-first preference for every app the
     /// system agrees with, and only diverges where the system has demonstrably
     /// filed an app under a different name.
-    static func reconciled(_ candidates: [String?]) -> MenuBarItemTag.Namespace {
+    public static func reconciled(_ candidates: [String?]) -> MenuBarItemTag.Namespace {
         let names = candidates.compactMap { $0 }.filter { !$0.isEmpty }
         let known = systemStatusNamespaces
         if !known.isEmpty, let match = names.first(where: { known.contains($0) }) {

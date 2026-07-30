@@ -416,7 +416,18 @@ nonisolated enum MenuBarItemAXProvider {
         case _ where Constants.isThawOwnedBundleIdentifier(bundleID):
             return .thaw
         default:
-            return .string(bundleID)
+            // macOS 27 files status items in TrailingItemPreferredPositions
+            // (com.apple.MenuBarAgent) under `status:<namespace>::<autosave>`.
+            // For most apps <namespace> is the bundle identifier, but
+            // MenuBarAgent falls back to the process/localized name for helpers
+            // whose bundle it cannot resolve — iStat Menus is filed as
+            // "iStat Menus Menubar", not "com.bjango.istatmenus.status", even
+            // though NSRunningApplication reports the latter. Keying on the
+            // bundle ID there addresses a key the system never uses.
+            //
+            // Prefer whichever candidate the system already recognizes; fall
+            // back to the bundle ID when it recognizes neither.
+            return MenuBarItemTag.Namespace.reconciled([bundleID, localizedName])
         }
     }
 
