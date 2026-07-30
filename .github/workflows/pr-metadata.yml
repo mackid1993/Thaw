@@ -4,6 +4,8 @@ name: "PR Metadata"
 # Uses pull_request_target so fork PRs can still receive labels.
 # DCO is verified via the Pulls commits API only (no checkout of PR code).
 # Crowdin sync PRs are skipped — they are translation-only and often huge.
+# They are matched on head branch + same-repo + maintainer association, never on
+# PR title, so an untrusted fork cannot title its way past the checks.
 #
 # Spam guard: do not run on `edited` (title/body tweaks). Size heads-ups go to
 # the job summary only — never PR comments — so pushes don't bump the timeline.
@@ -34,15 +36,21 @@ jobs:
             const pr = context.payload.pull_request;
             if (!pr) return;
 
-            // Crowdin sync PRs are trusted translation dumps; skip labeling/shape checks.
-            if ((pr.title || '').toLowerCase().includes('crowdin')) {
-              core.info('Skipping PR metadata for Crowdin sync PR.');
-              return;
-            }
-
             const body = pr.body || '';
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+
+            // Crowdin sync PRs are trusted translation dumps; skip labeling/shape checks.
+            // Identified by head branch + same-repo + maintainer association — never by
+            // PR title, which any untrusted fork author can set to bypass checks.
+            const isCrowdinSync =
+              pr.head?.ref === 'l10n_development' &&
+              pr.head?.repo?.full_name === `${owner}/${repo}` &&
+              ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(pr.author_association || '');
+            if (isCrowdinSync) {
+              core.info('Skipping PR metadata for Crowdin sync PR.');
+              return;
+            }
 
             // PR change kinds — never map Bug fix to `bug` (that label is issue-only).
             const typeLabels = {
@@ -227,11 +235,6 @@ jobs:
             const pr = context.payload.pull_request;
             if (!pr) return;
 
-            if ((pr.title || '').toLowerCase().includes('crowdin')) {
-              core.info('Skipping PR conventions for Crowdin sync PR.');
-              return;
-            }
-
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const title = pr.title || '';
@@ -240,6 +243,17 @@ jobs:
             const association = pr.author_association || '';
             const author = pr.user?.login || '';
             const maintainerAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+
+            // See the labeling step: Crowdin sync PRs are recognised by head branch,
+            // same-repo origin and maintainer association, never by PR title.
+            const isCrowdinSync =
+              pr.head?.ref === 'l10n_development' &&
+              pr.head?.repo?.full_name === `${owner}/${repo}` &&
+              maintainerAssociations.has(association);
+            if (isCrowdinSync) {
+              core.info('Skipping PR conventions for Crowdin sync PR.');
+              return;
+            }
 
             const failures = [];
             const warnings = [];
@@ -264,6 +278,8 @@ jobs:
             }
 
             // DCO: every non-merge, non-bot commit needs Signed-off-by matching the author email.
+            // Exemptions are an exact allowlist of verified bot identities; substring
+            // matching on the login would let any account named `…crowdin…` skip DCO.
             const dcoBotLogins = new Set([
               'dependabot[bot]',
               'renovate[bot]',
@@ -271,6 +287,22 @@ jobs:
               'crowdin[bot]',
               'crowdin-bot',
             ]);
+
+            // Sign-off must live in the trailing trailer block (as `git commit -s`
+            // writes it), so a `Signed-off-by:` line quoted in the body does not count.
+            const trailerBlock = (message) => {
+              const lines = message.replace(/\s+$/, '').split('\n');
+              let start = lines.length;
+              for (let i = lines.length - 1; i >= 0; i--) {
+                const line = lines[i];
+                if (line.trim() === '') break;
+                // A trailer is `Key: value`, or a folded continuation line.
+                if (!/^[A-Za-z][A-Za-z0-9-]*:\s/.test(line) && !/^\s+\S/.test(line)) break;
+                start = i;
+              }
+              return lines.slice(start);
+            };
+
             const commits = await github.paginate(github.rest.pulls.listCommits, {
               owner,
               repo,
@@ -279,8 +311,7 @@ jobs:
             });
             const dcoMissing = [];
             for (const entry of commits) {
-              const login = entry.author?.login || '';
-              if (dcoBotLogins.has(login) || login.toLowerCase().includes('crowdin')) {
+              if (dcoBotLogins.has(entry.author?.login || '')) {
                 continue;
               }
               if ((entry.parents || []).length > 1) {
@@ -293,7 +324,7 @@ jobs:
                 continue;
               }
               const signoffEmails = [];
-              for (const line of message.split('\n')) {
+              for (const line of trailerBlock(message)) {
                 const match = line.match(/^Signed-off-by:\s*.+<([^>]+)>\s*$/i);
                 if (match) signoffEmails.push(match[1].trim().toLowerCase());
               }
