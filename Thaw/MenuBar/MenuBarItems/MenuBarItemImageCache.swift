@@ -1721,6 +1721,28 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
                 continue
             }
 
+            // The width guard above only catches *narrow* chevron bleed. The
+            // native overflow chevron can appear, move, or widen between the
+            // pre-capture probe and the screenshot, because concealment is
+            // decided mid-cycle ("automatic overflow now conceals N item(s)").
+            // When that happens a concealed item's AX bounds land on the
+            // chevron, and the resulting crop is a picture of the chevron that
+            // is wide enough to sail past the width check — which is how real
+            // apps (Snagit, Cryptomator) end up cached as "«". Re-check the
+            // intersection against the bounds observed for this capture so the
+            // app-icon fallback takes over instead.
+            if !item.tag.isLayoutAnchoredSystemItem,
+               Self.isContaminatedByNativeOverflow(bounds, overflowBounds: overflowBounds)
+            {
+                MenuBarItemImageCache.diagLog.debug(
+                    "axBoundsCapture: rejecting native-overflow-contaminated crop " +
+                        "for \(item.logString); caching would show a chevron"
+                )
+                result.excluded.append(item)
+                result.invalidatedTags.insert(item.tag)
+                continue
+            }
+
             recordCaptureSuccess(for: item)
             cropRectOwners[cropRect] = item.tag
             result.images[item.tag] = captured

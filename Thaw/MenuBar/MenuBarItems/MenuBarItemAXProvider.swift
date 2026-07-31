@@ -405,6 +405,13 @@ nonisolated enum MenuBarItemAXProvider {
 
     // MARK: Helpers
 
+    /// iStat Menus' menu bar helper, under either namespace the system may
+    /// file it as. See ``identityTitle(namespace:identifier:accessibilityDescription:displayTitle:)``.
+    static func isIStatNamespace(_ namespace: MenuBarItemTag.Namespace) -> Bool {
+        namespace == .string("com.bjango.istatmenus.status") ||
+            namespace == .string("iStat Menus Menubar")
+    }
+
     /// Maps a running application to the namespace used for its items.
     static func namespace(forBundleIdentifier bundleID: String?, localizedName: String? = nil) -> MenuBarItemTag.Namespace {
         guard let bundleID else {
@@ -441,7 +448,15 @@ nonisolated enum MenuBarItemAXProvider {
         displayTitle: String
     ) -> String {
         // For non-iStat apps AXIdentifier is stable by convention; return raw.
-        guard namespace == .string("com.bjango.istatmenus.status") else {
+        //
+        // iStat must be recognized under *either* namespace: macOS files its
+        // items under the process name ("iStat Menus Menubar") while
+        // NSRunningApplication reports the bundle ID, and namespace(for:)
+        // reconciles to whichever the system uses. Matching only the bundle ID
+        // here would skip canonicalization whenever reconciliation picks the
+        // process name, letting live metric values back into the identity and
+        // churning it on every refresh.
+        guard Self.isIStatNamespace(namespace) else {
             return identifier?.nonEmpty ?? displayTitle
         }
 
