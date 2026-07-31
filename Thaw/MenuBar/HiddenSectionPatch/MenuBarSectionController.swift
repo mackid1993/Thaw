@@ -310,7 +310,13 @@ final class MenuBarSectionController: ObservableObject {
     private var recoveryDriver: MenuBarRecoveryDriver?
 
     convenience init(appState: AppState) {
-        let positionStore = RuntimePreferenceStore()
+        let rawPositionStore = RuntimePreferenceStore()
+        // Wrapped so keys macOS files under a process name are seen and written
+        // in bundle-identifier form. See ``NamespaceAliasingPreferenceStore``.
+        // This instance feeds the runtime engine's environment (see the
+        // `readPositions` closure below), so the translation reaches the
+        // key resolution that actually matters.
+        let positionStore = NamespaceAliasingPreferenceStore(wrapping: rawPositionStore)
         self.init(
             appState: appState,
             backend: RuntimeSessionController(),
@@ -318,7 +324,7 @@ final class MenuBarSectionController: ObservableObject {
             cgsWindowHider: RuntimeWindowController(),
             axItemHider: AXItemHider(),
             positionStore: positionStore,
-            positionHideBackend: PositionHideBackend(store: positionStore)
+            positionHideBackend: PositionHideBackend(store: rawPositionStore)
         )
     }
 
