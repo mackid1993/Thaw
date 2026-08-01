@@ -151,7 +151,12 @@ final class ThawAssessmentSessionController: RuntimeSessionControllering {
             return false
         }
 
-        let systemItems = Self.allSystemItemIDs.map { NSNumber(value: $0) } as NSArray
+        // String, not NSNumber. RuntimeSessionController logs this array as
+        // `systemItems=["0", "1", ... "8"]` — quoted — and passing NSNumbers
+        // produced an assertion that activated without concealing anything it
+        // was told to conceal, which invalidated the first round of testing
+        // here: the allowlist never took effect, so its contents proved nothing.
+        let systemItems = Self.allSystemItemIDs.map { String($0) } as NSArray
         let bundles = Array(allowlist).sorted() as NSArray
 
         guard let configuration = makeConfiguration(systemItems: systemItems, bundles: bundles) else {

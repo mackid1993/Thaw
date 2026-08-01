@@ -354,6 +354,10 @@ final class MenuBarSectionController: ObservableObject {
         // This instance feeds the runtime engine's environment (see the
         // `readPositions` closure below), so the translation reaches the
         // key resolution that actually matters.
+        // Must run before any configuration is built, i.e. before the session
+        // controller below exists. See ``AssessmentAllowlistPatch``.
+        AssessmentAllowlistPatch.installIfNeeded()
+
         let positionStore = NamespaceAliasingPreferenceStore(wrapping: rawPositionStore)
         // `ThawUseNativeAssertion` swaps in an allowlist Thaw builds itself, so
         // apps macOS files under a process name rather than a bundle identifier
