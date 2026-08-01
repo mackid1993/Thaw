@@ -57,7 +57,25 @@ import ObjectiveC.runtime
 /// removed them from the array before this sees it, so their alternate spellings
 /// are never added and concealment keeps working.
 ///
-/// Opt out with `ThawDisableAllowlistSpellingPatch`.
+/// ## Refuted — kept dormant
+///
+/// MenuBarAgent does not resolve a *wrong* owner string for these items. It
+/// resolves **no owner at all**. Its own log (`subsystem == "com.apple.menubar"`,
+/// category `statusItems`) emits `No server elements for status item: nil` for
+/// exactly five items in every burst, ~4 ms after `didActivateVisibilityRestriction`,
+/// constant regardless of what is concealed — while the bundle actually being
+/// concealed is logged by name in the same burst. Restriction does not null an
+/// owner; the `nil` is intrinsic to those items.
+///
+/// An allowlist is `[String]`. No string matches `nil`, at any spelling or width,
+/// so those items are unconditionally not-allowed the moment any visibility
+/// restriction is held, from any origin. This patch was observed running at
+/// 03:30:51.134 — logging that it had added the process-name spelling — with the
+/// five items going dark 4 ms later in the same second.
+///
+/// Left in place, off by default, because it is correct in itself and costs
+/// nothing: it makes the allowlist name apps the way macOS keys them. It simply
+/// does not address this defect, which has no client-side fix.
 enum AssessmentAllowlistPatch {
     private static let log = DiagLog(category: "AllowlistPatch")
     private static var isInstalled = false
@@ -71,8 +89,10 @@ enum AssessmentAllowlistPatch {
     /// step leaves the shipped behaviour untouched.
     static func installIfNeeded() {
         guard !isInstalled else { return }
-        guard !UserDefaults.standard.bool(forKey: "ThawDisableAllowlistSpellingPatch") else {
-            log.info("allowlist spelling patch disabled by preference")
+        // Default OFF: the premise below was disproven after this was written.
+        // See the refutation in the type documentation. Opt in with
+        // `ThawEnableAllowlistSpellingPatch` if the server behaviour ever changes.
+        guard UserDefaults.standard.bool(forKey: "ThawEnableAllowlistSpellingPatch") else {
             return
         }
         isInstalled = true
@@ -142,6 +162,10 @@ enum AssessmentAllowlistPatch {
             }
         }
 
+        // Tried and rejected: appending "", "(null)", "nil" and "<nil>" as
+        // sentinels for the nil-owner case. MenuBarAgent still tore down the
+        // same five items 9 ms after didActivateVisibilityRestriction, so a
+        // bridged optional owner does not compare equal to any of them.
         guard !additions.isEmpty else { return bundleIdentifiers }
         return (allowed + additions) as NSArray
     }

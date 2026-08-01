@@ -1737,6 +1737,12 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
         }
 
         for (item, bounds) in candidates {
+            // The gate is released by every eviction site (see
+            // `PreConcealWarmStore.release`), so membership here now implies the
+            // warm glyph is still held. Previously the set was insert-only while
+            // nothing protected the image, so an evicted glyph left the tag
+            // gated, capture was skipped forever, and the item showed a generic
+            // app icon for the rest of the session.
             if PreConcealWarmStore.shared.contains(item.tag) {
                 // Already photographed while it was drawable, and unreachable
                 // now. Excluded WITHOUT invalidating, so the warm glyph stands.
@@ -2472,12 +2478,19 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
         if !images.isEmpty {
             let targetSize = images.count / 2
             let removeCount = images.count - targetSize
-            let tagsToRemove = leastRecentlyUsedTags(count: removeCount)
+            // A pre-conceal glyph cannot be re-captured: the item it belongs to
+            // is no longer drawn anywhere on screen. Evicting one does not cost a
+            // recapture, it costs the glyph outright.
+            let tagsToRemove = leastRecentlyUsedTags(
+                count: removeCount,
+                excluding: preConcealWarmedTags
+            )
 
             for tag in tagsToRemove {
                 images.removeValue(forKey: tag)
                 accessTimestamps.removeValue(forKey: tag)
             }
+            PreConcealWarmStore.shared.release(tagsToRemove)
             MenuBarItemImageCache.diagLog.info(
                 "Memory pressure: Cleared \(tagsToRemove.count) items from cache"
             )
@@ -2696,16 +2709,33 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
             // be photographed again, so erring generous is right: the draw path
             // aspect-fits and centres, and `captureCropRect` clamps anything that
             // would run off the composite.
+            // `trustBounds: true` disables both the overlap invariant and the
+            // narrow-crop guard. That is only defensible while every item is
+            // genuinely still drawn — the whole premise of a *pre*-conceal warm.
+            // Once anything is concealed, collateral-hidden items keep reporting
+            // their pre-concealment frames, so trusting those bounds pins a crop
+            // of whatever reflowed into those pixels, permanently: the tag is
+            // added to the warm store and skipped by every later pass.
+            // `setSection` reaches here on every drag into a non-visible section,
+            // long after concealment is active, which is the "moving one item
+            // corrupts an unrelated icon" report.
+            let isConcealmentActive = self.appState?.menuBarManager.sectionController?
+                .assertionConcealedIdentifiers.isEmpty == false
             let result = await self.axBoundsCapture(
                 items.map { (item: $0, bounds: $0.bounds.insetBy(dx: -2, dy: 0)) },
                 scale: scale,
                 displayID: displayID,
                 validateFreshBounds: false,
-                trustBounds: true
+                trustBounds: !isConcealmentActive
             )
             for (tag, image) in result.images {
                 self.images[tag] = image
-                self.preConcealWarmedTags.insert(tag)
+                // Only pin the tag when the capture was actually taken against a
+                // drawn bar. Pinning during active concealment is what makes a
+                // bad glyph permanent rather than self-healing.
+                if !isConcealmentActive {
+                    self.preConcealWarmedTags.insert(tag)
+                }
             }
             MenuBarItemImageCache.diagLog.info(
                 "pre-conceal capture: stored \(result.images.count) of \(items.count) glyph(s)"
@@ -2912,7 +2942,10 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
             // This prevents thrashing the cache for visible items when
             // many transient items come and go (e.g. monitor hotplug).
             if images.count > Self.maxCacheSize {
-                let protectedTags = allValidTags
+                // Warmed glyphs join the protected set for the same reason as in
+                // `handleMemoryPressure`: they are unrecapturable, so eviction is
+                // permanent loss rather than a cache miss.
+                let protectedTags = allValidTags.union(preConcealWarmedTags)
                 let excessCount = images.count - Self.maxCacheSize
                 let tagsToRemove = leastRecentlyUsedTags(
                     count: excessCount,
@@ -2923,6 +2956,7 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
                     images.removeValue(forKey: tag)
                     accessTimestamps.removeValue(forKey: tag)
                 }
+                PreConcealWarmStore.shared.release(tagsToRemove)
 
                 if !tagsToRemove.isEmpty {
                     MenuBarItemImageCache.diagLog.info(
@@ -3493,5 +3527,17 @@ nonisolated final class PreConcealWarmStore: @unchecked Sendable {
 
     func contains(_ tag: MenuBarItemTag) -> Bool {
         lock.withLock { storage.contains(tag) }
+    }
+
+    /// Releases the gate for tags whose warm glyph is no longer held.
+    ///
+    /// The gate and the glyph must not be able to diverge. This set is consulted
+    /// from a nonisolated capture path while the images live on the main actor,
+    /// so the capture path cannot check the cache directly; instead every
+    /// eviction site calls this. Without it an evicted warm glyph left the tag
+    /// permanently gated, capture was skipped forever, and the item showed a
+    /// generic app icon for the rest of the session.
+    func release(_ tags: some Sequence<MenuBarItemTag>) {
+        lock.withLock { storage.subtract(tags) }
     }
 }

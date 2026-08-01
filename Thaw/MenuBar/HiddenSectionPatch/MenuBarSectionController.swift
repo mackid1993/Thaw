@@ -2366,7 +2366,29 @@ final class MenuBarSectionController: ObservableObject {
            hasConcealedItems,
            let warmState = self.appState
         {
-            let drawn = allItems.filter { !$0.isControlItem }
+            // Only the items concealment actually takes off the bar. Warming
+            // *everything* pinned the whole bar's glyphs for the session — the
+            // warm store gates capture, so after one pass the log showed
+            // "17 items failed capture" on every tick forever and no icon could
+            // ever update again. Two other consumers read the store as "this is
+            // a phantom" (`ordered`, LayoutBarPaddingView's notch marker), so a
+            // bar-wide warm also made visible order fall back entirely to
+            // authored order and hid the notch marker permanently.
+            let concealed = assertionConcealedIdentifiers
+            // Collateral casualties, expressed as the general condition rather
+            // than by name: an item whose owner macOS does not key by its bundle
+            // identifier is dropped whenever the assertion is held, even though
+            // Thaw never concealed it. Those items are equally unable to be
+            // photographed afterwards, so they belong in the warm too.
+            let runningBundleIDs = Set(
+                NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
+            )
+            let drawn = allItems.filter { item in
+                guard !item.isControlItem else { return false }
+                if concealed.contains(item.uniqueIdentifier) { return true }
+                let owner = item.tag.namespace.description
+                return !owner.isEmpty && !runningBundleIDs.contains(owner)
+            }
             if !drawn.isEmpty {
                 // Latch only once there is actually something to photograph.
                 // Setting it above the guard meant the very first refresh — which
