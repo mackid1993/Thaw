@@ -80,7 +80,7 @@ protocol RuntimePreferenceProviding: AnyObject {
 extension RuntimePreferenceStore: RuntimePreferenceProviding {}
 
 extension RuntimePreferenceProviding {
-    /// Removes stale Thaw control-item keys from `TrailingItemPreferredPositions`.
+    /// Removes stale Thaw-owned keys from `TrailingItemPreferredPositions`.
     ///
     /// Implemented here (not required on the protocol) so Thaw builds against
     /// published `prk-bin` where ``RuntimePreferenceStore/pruneOrphanedControlItemKeys(currentOwners:)``
@@ -90,9 +90,11 @@ extension RuntimePreferenceProviding {
     func pruneOrphanedControlItemKeys(currentOwners: Set<String>) -> [String] {
         let positions = readPositions()
         let orphans = positions.keys.filter { key in
-            guard let parsed = parseControlItemStatusKey(key),
-                  parsed.autosave.hasPrefix(ControlItemIdentifier.autosavePrefix)
-            else {
+            guard let parsed = parseControlItemStatusKey(key) else { return false }
+            if parsed.autosave.hasPrefix("Thaw.ItemGroup.") {
+                return true
+            }
+            guard parsed.autosave.hasPrefix(ControlItemIdentifier.autosavePrefix) else {
                 return false
             }
             return !currentOwners.contains(parsed.owner)
@@ -287,6 +289,42 @@ final class MenuBarSectionController: ObservableObject {
     }
 
     private var lastRefreshSignature: String?
+
+    /// The assignment last handed to the assertion backend, so an identical one
+    /// is never handed over twice. See the guard in ``refresh(forceRestrictionPulse:)``.
+    private var lastAppliedBackendAssignment: [String: MenuBarSection.Name]?
+
+    /// Whether the one-time pre-concealment glyph warm has run this launch.
+    private var hasWarmedGlyphsBeforeConcealment = false
+
+    /// Identifiers the assertion is concealing **right now**.
+    ///
+    /// Deliberately derived from the assignment the backend actually took, not
+    /// from ``section(for:)``. The two differ exactly when it matters: revealing
+    /// the hidden section (opening the Thaw Bar) releases the concealment while
+    /// the items keep their `.hidden` *assignment*, so they are on screen and
+    /// very much capturable. Keying a capture skip on the assignment instead
+    /// leaves the Thaw Bar with no images at all — items present but blank.
+    var assertionConcealedIdentifiers: Set<String> {
+        guard let applied = lastAppliedBackendAssignment, backend.isHolding else {
+            return []
+        }
+        var concealed = Set(applied.filter { $0.value != .visible }.keys)
+        // A reveal in progress is exactly when these items ARE on screen and
+        // must be captured. `prewarmConcealedImagesMacOS27` opens the Thaw Bar
+        // by releasing the restriction, photographing the items, and
+        // re-concealing; if the capture is skipped because the *assignment*
+        // still says hidden, no image is ever stored, `prewarmNeedsCapture`
+        // stays true, and the reveal/capture/conceal cycle runs again on every
+        // open — which is the Thaw Bar "bouncing around" when it opens.
+        if let revealedSection {
+            concealed.subtract(
+                applied.filter { $0.value == revealedSection }.keys
+            )
+        }
+        concealed.subtract(temporarilyRevealedIDs)
+        return concealed
+    }
     private var nativeOverflowProbeTask: Task<Void, Never>?
     private var nativeOverflowState = NativeOverflowStateReducer()
     private var pendingNativeOverflowRebalance = false
@@ -423,12 +461,11 @@ final class MenuBarSectionController: ObservableObject {
         prefsWatcher?.noteSelfWrite()
     }
 
-    /// Drops control-item preferred-position keys left in the shared
-    /// `TrailingItemPreferredPositions` dictionary by earlier builds and retired
-    /// host agents. Only keys owned by an identity other than this running build
-    /// are removed, so the live control keys are preserved; this trims the
-    /// dictionary MenuBarAgent renormalises and prevents key resolution from ever
-    /// matching a stale variant. macOS 27 only — gated by the sole caller
+    /// Drops preferred-position keys left by retired Thaw controls and the
+    /// abandoned group-proxy experiment. Group-proxy autosave names are always
+    /// removed because current builds never create them. Current control keys
+    /// are preserved; only controls owned by a different build identity are
+    /// pruned. macOS 27 only — gated by the sole caller
     /// (``startRuntimeStateObservers``), and inert on macOS 26 regardless.
     private func pruneOrphanedControlItemKeys() {
         let owners = Set(
@@ -611,9 +648,8 @@ final class MenuBarSectionController: ObservableObject {
               let appState,
               hasDesiredAssertionRestriction
         else { return false }
-        let assignment = assertionAssignmentInput()
         let didChange = backend.pulse(
-            sectionAssignment: assignment,
+            sectionAssignment: assertionAssignmentInput(),
             allItems: appState.itemManager.itemCache.managedItems
         )
         noteRecoveryRestrictionChange(didChange)
@@ -1095,6 +1131,7 @@ final class MenuBarSectionController: ObservableObject {
         let previous = revealedSection
         revealedSection = nil
         lastRefreshSignature = nil
+        lastAppliedBackendAssignment = nil
         diagLog.info("hideRevealedSections(previous=\(previous?.rawValue ?? "none"))")
         refresh()
     }
@@ -1111,6 +1148,43 @@ final class MenuBarSectionController: ObservableObject {
         if didInsert {
             refresh()
         }
+    }
+
+    /// Reveals several items with a **single** restriction change.
+    ///
+    /// Every restriction change re-composites the whole bar. Revealing items one
+    /// at a time to photograph them therefore costs `2 × count` re-composites,
+    /// and with a handful of hidden items that is a visible, sustained shudder —
+    /// reported 2026-07-31 as the Thaw Bar "bouncing around" every time it
+    /// opens. Batching makes it two, whatever the count.
+    func revealItemsTemporarily(_ identifiers: [String]) {
+        var didInsert = false
+        for identifier in identifiers {
+            if temporarilyRevealedIDs.insert(identifier).inserted {
+                didInsert = true
+            }
+            temporaryRevealConcealTasks[identifier]?.cancel()
+            temporaryRevealConcealTasks[identifier] = nil
+        }
+        guard didInsert else { return }
+        diagLog.info("revealItemsTemporarily(\(identifiers.count) item(s)); batched reveal")
+        refresh()
+    }
+
+    /// Re-conceals items revealed via ``revealItemsTemporarily(_:)``, again with
+    /// one restriction change.
+    func concealTemporarilyRevealedItems(_ identifiers: [String]) {
+        var didRemove = false
+        for identifier in identifiers {
+            temporaryRevealConcealTasks[identifier]?.cancel()
+            temporaryRevealConcealTasks[identifier] = nil
+            if temporarilyRevealedIDs.remove(identifier) != nil {
+                didRemove = true
+            }
+        }
+        guard didRemove else { return }
+        diagLog.info("concealTemporarilyRevealedItems(\(identifiers.count) item(s)); batched conceal")
+        refresh()
     }
 
     /// Re-conceals an item previously revealed via ``revealItemTemporarily``.
@@ -1235,16 +1309,60 @@ final class MenuBarSectionController: ObservableObject {
     /// those items may not have meaningful live positions.
     func ordered(_ items: [MenuBarItem], in section: MenuBarSection.Name) -> [MenuBarItem] {
         let order = sectionItemOrder[section] ?? []
-        return Self.orderedItems(items, in: section, using: order)
+        let phantoms = Set(
+            items.filter { PreConcealWarmStore.shared.contains($0.tag) }
+                .map(\.uniqueIdentifier)
+        )
+        return Self.orderedItems(items, in: section, using: order, phantomIdentifiers: phantoms)
     }
 
     static func orderedItems(
         _ items: [MenuBarItem],
         in section: MenuBarSection.Name,
-        using order: [String]
+        using order: [String],
+        phantomIdentifiers: Set<String> = []
     ) -> [MenuBarItem] {
         if section == .visible {
-            return liveVisualOrder(items)
+            // Spatial truth for items that have one; authored slots for items
+            // that do not.
+            //
+            // The visible section mirrors physical reality by design, but for a
+            // collateral-hidden item "physical reality" is a frozen frame from
+            // before concealment. Ranking those by bounds meant a committed
+            // group reorder could never surface: the drop wrote the new order,
+            // the log showed the commit, and this line quietly re-sorted the
+            // members back to their phantom coordinates every publish. Solid
+            // items keep live spatial order — including cmd-drags Thaw did not
+            // make — and each phantom is slotted after the last item that
+            // precedes it in the authored order.
+            let solid = liveVisualOrder(
+                items.filter { !phantomIdentifiers.contains($0.uniqueIdentifier) }
+            )
+            let phantoms = items.filter { phantomIdentifiers.contains($0.uniqueIdentifier) }
+            guard !phantoms.isEmpty, !order.isEmpty else {
+                return liveVisualOrder(items)
+            }
+            let canonicalOrder = MenuBarItemTag.canonicalPersistentIdentifiers(order)
+            let rank = Dictionary(
+                canonicalOrder.enumerated().map { ($1, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            func authoredRank(_ item: MenuBarItem) -> Int? {
+                rank[MenuBarItemTag.canonicalPersistentIdentifier(item.uniqueIdentifier)]
+            }
+            var result = solid
+            for phantom in phantoms.sorted(by: { (authoredRank($0) ?? .max) < (authoredRank($1) ?? .max) }) {
+                guard let pr = authoredRank(phantom) else {
+                    result.append(phantom)
+                    continue
+                }
+                if let idx = result.lastIndex(where: { (authoredRank($0) ?? .max) < pr }) {
+                    result.insert(phantom, at: idx + 1)
+                } else {
+                    result.insert(phantom, at: 0)
+                }
+            }
+            return result
         }
 
         let ranked: [MenuBarItem]
@@ -1642,6 +1760,18 @@ final class MenuBarSectionController: ObservableObject {
     /// Used by macOS 27 overflow rebalance so Spawner floods do not pay N
     /// restriction pulses.
     func setSection(_ section: MenuBarSection.Name, items: [MenuBarItem]) {
+        // Photograph anything being sent out of sight, right now, while it is
+        // still drawn. This is the discrete moment an item's visibility changes,
+        // so it is both the correct and the cheapest place to warm the cache —
+        // no polling, no reveal-and-re-conceal dance when the Thaw Bar opens.
+        if section != .visible, let warmState = appState {
+            let live = warmState.itemManager.itemCache.managedItems
+            let wanted = Set(items.map(\.uniqueIdentifier))
+            let drawn = live.filter { wanted.contains($0.uniqueIdentifier) }
+            if !drawn.isEmpty {
+                warmState.imageCache.captureBeforeConceal(items: drawn)
+            }
+        }
         guard !items.isEmpty else { return }
 
         if section == .alwaysHidden,
@@ -1691,6 +1821,18 @@ final class MenuBarSectionController: ObservableObject {
     /// `MenuBarItem`; it can identify Thaw-owned generic `Item-0` entries even
     /// when their persisted identifier is not the stable control-item title.
     func setSection(_ section: MenuBarSection.Name, item: MenuBarItem) {
+        // Photograph anything being sent out of sight, right now, while it is
+        // still drawn. This is the discrete moment an item's visibility changes,
+        // so it is both the correct and the cheapest place to warm the cache —
+        // no polling, no reveal-and-re-conceal dance when the Thaw Bar opens.
+        if section != .visible, let warmState = appState {
+            let live = warmState.itemManager.itemCache.managedItems
+            let wanted = Set([item].map(\.uniqueIdentifier))
+            let drawn = live.filter { wanted.contains($0.uniqueIdentifier) }
+            if !drawn.isEmpty {
+                warmState.imageCache.captureBeforeConceal(items: drawn)
+            }
+        }
         // Reject control/anchored/own items, and any item that can't be hidden
         // being dropped into a non-visible section (Apple system modules on
         // macOS 27): they stay visible. Dropping one back to .visible is always
@@ -1735,6 +1877,16 @@ final class MenuBarSectionController: ObservableObject {
         // Rebuild order from the new assignment, preserving relative order for
         // items that remain in the same section.
         var newOrder = [MenuBarSection.Name: [String]]()
+        // The visible section's authored order is not derivable from the
+        // assignment — visible items are the unassigned remainder — so a
+        // rebuild must carry it forward explicitly. Omitting it wiped
+        // `sectionItemOrder[.visible]` on every rebuild, which silently erased
+        // every committed visible reorder moments after the drop wrote it: the
+        // log showed `setSectionOrder(visible)` succeed, and the preview never
+        // changed. Root cause of "the grip drag doesn't work", 2026-08-01.
+        if let visibleOrder = sectionItemOrder[.visible], !visibleOrder.isEmpty {
+            newOrder[.visible] = visibleOrder
+        }
         for section in MenuBarSection.Name.allCases where section != .visible {
             let oldOrder = sectionItemOrder[section] ?? []
             let newIDs = Set(sanitized.filter { $0.value == section }.map(\.key))
@@ -1943,9 +2095,19 @@ final class MenuBarSectionController: ObservableObject {
         // it conceals any third-party app. Route third-party hiding through
         // preferred positions whenever either module is live, even when the
         // optional position backend setting is off.
-        let preservesPositionManagedSystemModules = allItems.contains {
+        //
+        // `ThawDisablePositionHidingOverride` opts out of that fallback. Position
+        // parking puts an item in the trailing overflow region, and that region
+        // is precisely what the native `»` announces — so as long as this
+        // override is in force, the chevron cannot go away, no matter what the
+        // backend preference says. Turning it off trades Focus / Now Playing
+        // collateral for a chevron-free bar, which is the trade some users want.
+        let allowsPositionFallback = !UserDefaults.standard.bool(
+            forKey: "ThawDisablePositionHidingOverride"
+        )
+        let preservesPositionManagedSystemModules = allowsPositionFallback && (allItems.contains {
             $0.tag.isPositionManageableMenuBarAgentItem
-        } || sectionAssignment.keys.contains(where: MenuBarItemTag.isPositionManageableMenuBarAgentIdentifier)
+        } || sectionAssignment.keys.contains(where: MenuBarItemTag.isPositionManageableMenuBarAgentIdentifier))
         let experimentalWindowHiding = appState.settings.advanced.enablePositionHiding || preservesPositionManagedSystemModules
         let invalidAssignmentIDs = Self.invalidAssignmentIdentifiers(
             sectionAssignment: sectionAssignment,
@@ -2054,6 +2216,83 @@ final class MenuBarSectionController: ObservableObject {
         let hasConcealedItems = backendAssignment.values.contains {
             $0 == .hidden || $0 == .alwaysHidden
         }
+        // Handing the backend an assignment it already holds is not free.
+        // `RuntimeSessionController` decides for itself whether to reactivate,
+        // and one of its triggers is items newly appearing among `allItems` —
+        // which churns constantly here, because iStat rewrites its own preferred
+        // position about once a second and its items' window IDs turn over with
+        // it. Every reactivation is a whole-bar re-composite.
+        //
+        // Measured 2026-07-31, same build and bar, varying only the size of the
+        // hidden section:
+        //
+        //   bundles concealed   `applying restriction` calls   iStat items blank
+        //          0                        0                          0
+        //          1                        7                          2
+        //          4                       25                          5
+        //
+        // The blanking tracks the call count, so suppressing no-op applies is
+        // the lever. A forced pulse still goes through: Reset-to-Hidden depends
+        // on a teardown/reactivate cycle even when the assignment is unchanged.
+        // Only suppress once something meaningful has actually been applied. An
+        // empty assignment is what the first refresh after launch computes,
+        // before the item cache has caught up — latching on that would skip
+        // every later apply and the assertion would never engage at all.
+        if !forceRestrictionPulse,
+           let lastApplied = lastAppliedBackendAssignment,
+           !lastApplied.isEmpty,
+           backendAssignment == lastApplied
+        {
+            diagLog.debug("skipping assertion apply: assignment unchanged")
+            return
+        }
+
+        // Before the FIRST apply that conceals anything, photograph every
+        // visible item — and defer the apply until that finishes.
+        //
+        // Not just the items being concealed. macOS 27 collaterally stops iStat
+        // Menus rendering the moment *any* bundle is concealed, even though iStat
+        // itself is allowed. So the last instant every glyph on the bar is
+        // capturable is immediately before the first concealing apply, and after
+        // it iStat can never be photographed again — not by revealing it either,
+        // because the collateral is caused by concealment existing at all, not by
+        // iStat's own state.
+        //
+        // The apply is deferred rather than raced: an earlier attempt fired the
+        // capture as a detached Task and logged "stored 0 of 3", because the
+        // restriction landed first and the items were gone before the shutter
+        // opened. Skipping this one pass costs a fraction of a second at launch
+        // and is invisible; getting it wrong costs every glyph for the session.
+        if !hasWarmedGlyphsBeforeConcealment,
+           hasConcealedItems,
+           let warmState = self.appState
+        {
+            let drawn = allItems.filter { !$0.isControlItem }
+            if !drawn.isEmpty {
+                // Latch only once there is actually something to photograph.
+                // Setting it above the guard meant the very first refresh — which
+                // hits an empty item cache, hence `apply: item cache is empty
+                // while N item(s) are assigned hidden` — burned the one-shot and
+                // the warm never ran at all.
+                hasWarmedGlyphsBeforeConcealment = true
+                diagLog.info(
+                    "pre-conceal warm: photographing all \(drawn.count) drawn item(s) before the first concealing apply"
+                )
+                // Clear the signature before re-entering, or the completion's
+                // refresh() hits the `signature == lastRefreshSignature` early
+                // return and the restriction is never applied at all — leaving
+                // the bar unconcealed until some unrelated interaction (the
+                // first Thaw Bar click) forces a refresh. Reported 2026-08-01:
+                // "when it first loads up, everything shows... as soon as I
+                // click the thaw bar, it disappears and hides everything."
+                lastRefreshSignature = nil
+                warmState.imageCache.captureBeforeConceal(items: drawn) { [weak self] in
+                    self?.refresh()
+                }
+                return
+            }
+        }
+
         assessmentStateMonitor?.noteSelfChange()
         let didChangeRestriction = if forceRestrictionPulse, hasConcealedItems {
             backend.pulse(
@@ -2066,6 +2305,19 @@ final class MenuBarSectionController: ObservableObject {
                 allItems: allItems
             )
         }
+        // Latch only what the backend actually took. Recording the assignment
+        // *before* the call was a bug: `RuntimeSessionController.apply` refuses
+        // outright when the item cache is momentarily empty —
+        //   "item cache is empty while N item(s) are assigned hidden;
+        //    keeping current restriction to avoid concealing everything"
+        // — which is exactly what the first refresh after launch hits. The
+        // guard above then latched an assignment that had never been applied
+        // and suppressed every subsequent attempt, so the assertion never
+        // engaged at all and the hidden items stayed on the bar.
+        lastAppliedBackendAssignment = (didChangeRestriction && backend.isHolding)
+            ? backendAssignment
+            : nil
+
         if didChangeRestriction {
             appState.itemManager.noteRestrictionChange()
             restoreVisibleControlItemAfterRestrictionChange()
@@ -2280,6 +2532,74 @@ final class MenuBarSectionController: ObservableObject {
         positionStore.writePositions(positions)
         prefsWatcher?.noteSelfWrite()
         diagLog.info("overflowPrevention: elevated \(overflowBase - 50000) hidden-item weight(s)")
+    }
+
+    /// Forces MenuBarAgent to re-lay-out *specific* items, without the whole-bar
+    /// re-composite that ``pulseRestrictionAfterReflow(liveItems:)`` causes.
+    ///
+    /// Motivation, measured 2026-07-31: under the assessment-mode assertion,
+    /// iStat Menus' five items keep correct AX bounds but draw nothing. Pulsing
+    /// the assertion does redraw them — for an instant — because the pulse
+    /// re-composites the entire bar, and that re-composite is itself what blanks
+    /// them. Pulsing to fix the blanking re-triggers its cause, which is the
+    /// flashing rather than a fix.
+    ///
+    /// A click on the item redraws it and sticks, so the owning app is still
+    /// serving content; only MenuBarAgent's layout pass for that item is stale.
+    /// Bumping the item's weight in `TrailingItemPreferredPositions` and putting
+    /// it straight back makes the agent redo exactly that one pass. Thaw already
+    /// owns and continuously writes this dictionary, so this needs no new
+    /// permission and touches no other application's preferences.
+    ///
+    /// The `+1` is safe against reordering: live weights on this Mac are spaced
+    /// by hundreds, and the original value is always restored.
+    @available(macOS 27, *)
+    @discardableResult
+    func nudgePositionsForRedraw(items: [MenuBarItem], allItems: [MenuBarItem]) async -> Int {
+        guard !items.isEmpty else { return 0 }
+
+        var positions = positionStore.readPositions()
+        let existingKeys = Array(positions.keys)
+        var originals = [String: Int]()
+
+        for item in items {
+            guard let key = RuntimePreferenceKeys.resolveKey(
+                for: item,
+                existingKeys: existingKeys,
+                positions: positions,
+                liveItems: allItems
+            ),
+            let current = positions[key],
+            originals[key] == nil
+            else { continue }
+            originals[key] = current
+            positions[key] = current + 1
+        }
+
+        guard !originals.isEmpty else {
+            diagLog.debug("redraw nudge: no resolvable position keys for \(items.count) blank item(s)")
+            return 0
+        }
+
+        positionStore.writePositions(positions)
+        prefsWatcher?.noteSelfWrite()
+
+        // Long enough for MenuBarAgent to observe the change and run a layout
+        // pass, short enough that the item never visibly moves.
+        try? await Task.sleep(for: .milliseconds(120))
+
+        // Re-read rather than reusing the local copy: the agent may have
+        // rewritten other keys in the meantime, and clobbering those would undo
+        // work Thaw did not do.
+        var restored = positionStore.readPositions()
+        for (key, value) in originals {
+            restored[key] = value
+        }
+        positionStore.writePositions(restored)
+        prefsWatcher?.noteSelfWrite()
+
+        diagLog.info("redraw nudge: bumped and restored \(originals.count) item weight(s)")
+        return originals.count
     }
 
     /// Re-applies the current assertion allowlist without changing assignment.

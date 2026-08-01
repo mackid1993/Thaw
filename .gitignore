@@ -18,6 +18,10 @@ build/
 !.github/actions/build/**
 plans/
 DerivedData/
+Build/
+BuildCandidate/
+BuildInstall/
+BuildTests/
 Sparkle
 MenuBarHost/.build/
 MenuBarHost/.swiftpm/

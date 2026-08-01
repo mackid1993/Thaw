@@ -280,6 +280,14 @@ nonisolated enum MenuBarItemAXProvider {
             let childDescendants = AXHelpers.childrenIfAvailable(for: child) ?? []
             return [child] + childDescendants
         }
+        // MEASURED 2026-07-30 on macOS 27.0 (26A5388g): this walk cannot find
+        // the native overflow control. MenuBarAgent's AXExtrasMenuBar publishes
+        // exactly three children — Wi-Fi, Control Center, Clock — and the bar
+        // answers `false` to AXOverflowButton. The chevron is drawn by the
+        // agent's compositor and is not an AX element at all, so both branches
+        // below always come up empty and `nativeOverflowControlBounds` returns
+        // []. Widening the glyph predicate cannot help; there is nothing to
+        // match. See `~/Desktop/thaw-chevron-findings-2.md`.
         var attributeReadFailed = false
         let attributedControls = ([bar] + children).compactMap { element -> AXSwift6.UIElement? in
             guard let supportsOverflowButton = AXHelpers.supportsOverflowButton(element) else {
@@ -455,17 +463,30 @@ nonisolated enum MenuBarItemAXProvider {
         // here would skip canonicalization whenever reconciliation picks the
         // process name, letting live metric values back into the identity and
         // churning it on every refresh.
-        guard Self.isIStatNamespace(namespace) else {
-            return identifier?.nonEmpty ?? displayTitle
+        // iStat Menus may put live metric values in AXIdentifier, AXDescription,
+        // or AXTitle depending on the version, so it alone consults all three.
+        // Every other app keeps the original two-step precedence: widening it
+        // would change the identity of apps that are not churning, and a
+        // changed identity is the very failure this canonicalization exists to
+        // stop.
+        let candidate = if Self.isIStatNamespace(namespace) {
+            identifier?.nonEmpty
+                ?? accessibilityDescription?.nonEmpty
+                ?? displayTitle
+        } else {
+            identifier?.nonEmpty ?? displayTitle
         }
 
-        // iStat Menus may put live metric values in AXIdentifier, AXDescription,
-        // or AXTitle depending on the version. Normalize whichever attribute is
-        // present so the identity stays stable across per-second updates.
-        let candidate = identifier?.nonEmpty
-            ?? accessibilityDescription?.nonEmpty
-            ?? displayTitle
-        return MenuBarItemTag.canonicalIStatMetricTitle(candidate)
+        // Normalize whichever attribute won for namespaces whose system
+        // position keys are independent of their live display title. Other
+        // namespaces pass through untouched.
+        guard case let .string(namespaceValue) = MenuBarItemTag.canonicalNamespace(namespace) else {
+            return candidate
+        }
+        return MenuBarItemTag.canonicalVolatileTitle(
+            namespaceValue: namespaceValue,
+            title: candidate
+        )
     }
 
     /// macOS 27 can publish native menu-bar overflow chevrons as AX extras

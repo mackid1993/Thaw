@@ -140,14 +140,56 @@ final class NamespaceAliasingPreferenceStore: RuntimePreferenceProviding {
         let raw = wrapped.readPositions()
         let map = MainActor.assumeIsolated { Self.aliasMap(for: raw) }
         guard !map.isEmpty else {
-            wrapped.writePositions(dict)
+            // Still refuse to invent placements. Aliasing and fabrication are
+            // independent problems: an app can need no namespace alias and still
+            // be keyed by an autosave name Thaw does not use, and this early
+            // return was letting exactly those writes through unchecked.
+            wrapped.writePositions(Self.dropFabricatedKeys(dict, existing: raw))
             return
         }
         var inverse = [String: String]()
         for (alias, bundleID) in map {
             inverse[bundleID] = alias
         }
-        wrapped.writePositions(Self.rewrite(dict, mapping: inverse))
+        wrapped.writePositions(Self.dropFabricatedKeys(Self.rewrite(dict, mapping: inverse), existing: raw))
+    }
+
+    /// Drops any `status:` key macOS is not already using.
+    ///
+    /// Thaw builds keys from its own canonical identity — folded titles such as
+    /// `CPU #%` or `iStat.Weather` — while macOS files the same item under the
+    /// namespace and autosave name *it* chose. Writing our spelling does not
+    /// replace theirs; MenuBarAgent honours both and lays the item out **twice**.
+    /// Measured 2026-08-01: ten position keys for five iStat modules, and the
+    /// menu bar drawing every module in duplicate.
+    ///
+    /// This is not specific to any app. Any item whose namespace or autosave name
+    /// differs from Thaw's internal identity fabricates a second placement the
+    /// same way, so the rule is stated as an invariant: Thaw may reposition items
+    /// macOS already knows about and must never invent a placement. A key with no
+    /// counterpart in the live dictionary is dropped rather than written.
+    private static func dropFabricatedKeys(
+        _ dict: [String: Int],
+        existing: [String: Int]
+    ) -> [String: Int] {
+        guard !existing.isEmpty else { return dict }
+        var result = [String: Int]()
+        result.reserveCapacity(dict.count)
+        var dropped = [String]()
+        for (key, value) in dict {
+            if !key.hasPrefix(prefix) || existing[key] != nil {
+                result[key] = value
+            } else {
+                dropped.append(key)
+            }
+        }
+        if !dropped.isEmpty {
+            diagLog.info(
+                "dropping \(dropped.count) fabricated position key(s) macOS does not use: " +
+                    dropped.sorted().joined(separator: ", ")
+            )
+        }
+        return result
     }
 
     func restoreAll() {

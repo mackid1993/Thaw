@@ -13,6 +13,11 @@ import PlatformRuntimeKit
 
 /// A container for the items in the menu bar layout interface.
 final class LayoutBarContainer: NSView {
+    private struct GroupDescriptor {
+        let memberIndices: [Int]
+        let memberIdentifiers: [String]
+    }
+
     /// Visual styling for the background drawn behind a same-bundle cluster.
     private enum GroupChrome {
         static let cornerRadius: CGFloat = 7
@@ -23,6 +28,9 @@ final class LayoutBarContainer: NSView {
         /// Horizontal space reserved to the left of a cluster for its drag handle.
         static let handleReservation: CGFloat = 15
     }
+
+    /// Temporary diagnostic channel for the Layout-preview investigation.
+    private static let layoutTraceLog = DiagLog(category: "LayoutTrace")
 
     /// The overlay grip views, one per detected cluster.
     private var groupHandleViews = [LayoutBarGroupHandleView]()
@@ -89,6 +97,8 @@ final class LayoutBarContainer: NSView {
 
     private var cancellables = Set<AnyCancellable>()
     private var suppressLittleSnitchUnresolvedSlot = false
+    /// Full membership keyed by the sole item retained for a collapsed group.
+    private var collapsedGroupMembersByRepresentative = [String: [String]]()
 
     /// Creates a container view with the given app state, section, and spacing.
     ///
@@ -176,6 +186,18 @@ final class LayoutBarContainer: NSView {
                 }
                 .store(in: &c)
 
+            // Editing a group changes which items cluster together, and the
+            // cluster chrome and drag handles are rebuilt from the arranged
+            // views — so the bar has to be laid out again, not just redrawn.
+            appState.settings.advanced.$itemGroups
+                .removeDuplicates()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    guard let self else { return }
+                    setArrangedViews(items: appState.itemManager.itemCache.managedItems(for: section))
+                }
+                .store(in: &c)
+
             // Detect when the Settings window is dragged to a display with a
             // different notch state. NSApplication.didChangeScreenParametersNotification
             // does not fire for window movement between screens, but
@@ -251,8 +273,8 @@ final class LayoutBarContainer: NSView {
 
         // Reserve a leading gap before the first member of each cluster so its
         // drag handle has room to sit without overlapping any item.
-        let groups = groupedMemberIndices()
-        let groupStarts = Set(groups.compactMap(\.first))
+        let groups = groupDescriptors()
+        let groupStarts = Set(groups.compactMap { $0.memberIndices.first })
 
         for (index, entry) in arrangedViews.enumerated() {
             var view: NSView = entry
@@ -296,41 +318,88 @@ final class LayoutBarContainer: NSView {
         needsDisplay = true
     }
 
-    /// Rebuilds the cluster drag-handle overlays to match the current groups.
+    /// Updates the cluster drag-handle overlays to match the current groups.
     ///
-    /// Handles are cheap and stateless, so they are recreated each layout pass
-    /// rather than diffed; a handle drag freezes `canSetArrangedViews`, so this
-    /// never runs mid-drag to invalidate the active dragging source.
+    /// Handles are **reused** across layout passes, not recreated. A handle
+    /// starts its drag in `mouseDragged`, which AppKit only delivers while the
+    /// pressed view is still in the hierarchy — and `canSetArrangedViews` is not
+    /// frozen until `draggingSession(_:willBeginAt:)`, i.e. *after* the drag has
+    /// already begun. Rebuilding the handles tears the pressed view out of the
+    /// window during that gap, and the drag silently never starts.
     ///
-    /// `groups` are member-index lists (a bundle's members may not be adjacent).
-    /// One handle serves the whole bundle and carries every member's identifier,
-    /// so dragging it gathers all members — not just a contiguous subset.
-    private func updateGroupHandles(groups: [[Int]]) {
-        for handle in groupHandleViews {
-            handle.removeFromSuperview()
+    /// The gap is not theoretical: `itemPreferredSizeDidChange` re-runs layout
+    /// whenever an item's width changes, and a live-updating item (iStat's CPU
+    /// percentage, a network rate) changes width several times a second. The
+    /// clusters most worth dragging were the ones that could not be dragged.
+    ///
+    /// A handle is reusable only when it serves exactly the same members in the
+    /// same order; any membership change builds a fresh one, because
+    /// `memberIdentifiers` is what the drop handler moves.
+    ///
+    /// `groups` are member-index lists (members may not be adjacent). One handle
+    /// serves the whole cluster and carries every member's identifier, so
+    /// dragging it gathers all members — not just a contiguous subset.
+    private func updateGroupHandles(groups: [GroupDescriptor]) {
+        // A handle the user is pressing must survive this pass untouched.
+        // Replacing it removes the pressed view from the window before AppKit
+        // delivers `mouseDragged`, and the drag then never begins at all — no
+        // drop, no refusal, nothing in the log. With a live-updating member
+        // (iStat's CPU percentage changes width several times a second)
+        // `itemPreferredSizeDidChange` re-runs layout constantly, so the window
+        // for this is effectively always open.
+        if groupHandleViews.contains(where: \.isTrackingPress) {
+            return
         }
-        groupHandleViews.removeAll()
 
-        for memberIndices in groups {
-            let views = memberIndices.compactMap { arrangedViews.indices.contains($0) ? arrangedViews[$0] : nil }
+        var reusable = groupHandleViews
+        var current = [LayoutBarGroupHandleView]()
+
+        for group in groups {
+            let views = group.memberIndices.compactMap { arrangedViews.indices.contains($0) ? arrangedViews[$0] : nil }
             guard let first = views.first else {
                 continue
             }
-            let memberIdentifiers = views.compactMap { view -> String? in
-                if case let .item(item) = view.kind {
-                    return item.uniqueIdentifier
-                }
-                return nil
-            }
+            let memberIdentifiers = group.memberIdentifiers
             guard memberIdentifiers.count >= 2 else {
                 continue
             }
 
-            let handle = LayoutBarGroupHandleView(
-                sourceContainer: self,
-                sourceSection: section,
-                memberIdentifiers: memberIdentifiers
-            )
+            // Reuse on member *set*, not ordered equality. Order here follows
+            // on-screen position, and a live-updating member changing width
+            // reorders the cluster several times a second — with ordered
+            // equality that minted a fresh handle each time, destroying any
+            // press in progress. Membership is what the drop handler acts on,
+            // so a reordered set is the same handle.
+            let handle: LayoutBarGroupHandleView
+            if let index = reusable.firstIndex(where: { Set($0.memberIdentifiers) == Set(memberIdentifiers) }) {
+                handle = reusable.remove(at: index)
+            } else {
+                handle = LayoutBarGroupHandleView(
+                    sourceContainer: self,
+                    sourceSection: section,
+                    memberIdentifiers: memberIdentifiers
+                )
+                addSubview(handle)
+            }
+
+            // Keep the grip in front of every item view, on every pass.
+            //
+            // `addSubview` ran only when a handle was created, but item views are
+            // added on later passes and therefore end up above it in the subview
+            // list. `hitTest` walks that list in reverse, so wherever the two
+            // overlap the item view swallows the mouse-down and the handle never
+            // receives `mouseDragged` — the drag simply never begins, with no
+            // drop and nothing logged. Re-ordering does not change view identity,
+            // so the pressed-handle guard above still holds.
+            // Only re-order when it is actually wrong. Doing
+            // `removeFromSuperview()` + `addSubview()` unconditionally churned
+            // the view hierarchy several times a second on a live bar, which
+            // tears the view out from under AppKit's tracking loop mid-press —
+            // reported 2026-08-01 as the Layout view freezing on a group drag.
+            if subviews.last !== handle {
+                addSubview(handle, positioned: .above, relativeTo: nil)
+            }
+
             let size = LayoutBarGroupHandleView.preferredSize(height: first.frame.height)
             handle.setFrameSize(size)
             handle.setFrameOrigin(
@@ -339,9 +408,14 @@ final class LayoutBarContainer: NSView {
                     y: first.frame.midY - (size.height / 2)
                 )
             )
-            addSubview(handle)
-            groupHandleViews.append(handle)
+            current.append(handle)
         }
+
+        // Whatever went unclaimed no longer describes a cluster in this bar.
+        for stale in reusable {
+            stale.removeFromSuperview()
+        }
+        groupHandleViews = current
     }
 
     /// Snapshots the member views of a cluster into a single drag image.
@@ -373,29 +447,88 @@ final class LayoutBarContainer: NSView {
         return (image, rect)
     }
 
-    /// The member-index lists of the arranged views that form each same-bundle
-    /// cluster. A bundle's members may not be adjacent, so each entry is the full
-    /// set of that bundle's member indices, not a contiguous range.
+    /// The member-index lists of the arranged views that form each cluster —
+    /// same-bundle groups plus the user's own groups. Members may not be
+    /// adjacent, so each entry is the full set of member indices, not a
+    /// contiguous range.
     ///
     /// Only item views carry a bundle tag; the badge and opaque slots are mapped
     /// to a non-groupable placeholder so they are never members.
-    private func groupedMemberIndices() -> [[Int]] {
+    private func groupDescriptors() -> [GroupDescriptor] {
         let tags: [MenuBarItemTag] = arrangedViews.map { view in
             if case let .item(item) = view.kind {
                 return item.tag
             }
             return .visibleControlItem
         }
-        return MenuBarItemGrouping.groups(in: tags).map(\.memberIndices)
+        let userGroups = appState?.settings.advanced.itemGroups ?? []
+        // Only user-defined groups get a pocket and a grip.
+        //
+        // `MenuBarItemGrouping.groups` also returns an implicit `.bundle`
+        // cluster for *any* app with two or more items — MenuBarAgent's Wi-Fi /
+        // Control Center / Clock, 1Password's two items, and so on. Drawing
+        // chrome around those is indistinguishable from a real group to anyone
+        // looking at the pane: with one group defined (iStat), every automatic
+        // cluster reads as "my group has the wrong items in it". Reported
+        // exactly that way on 2026-07-31, repeatedly, while the group's own
+        // definition was provably correct in the plist.
+        var descriptors = MenuBarItemGrouping.groups(in: tags, userGroups: userGroups)
+            .filter { group in
+                if case .user = group.identity { return true }
+                return false
+            }
+            .map { group in
+            let identifiers = group.memberIndices.compactMap { index -> String? in
+                guard arrangedViews.indices.contains(index),
+                      case let .item(item) = arrangedViews[index].kind
+                else { return nil }
+                return item.uniqueIdentifier
+            }
+            return GroupDescriptor(
+                memberIndices: group.memberIndices,
+                memberIdentifiers: identifiers
+            )
+        }
+        let representedIdentifiers = Set(descriptors.flatMap(\.memberIdentifiers))
+        for (representative, members) in collapsedGroupMembersByRepresentative
+            where !representedIdentifiers.contains(representative)
+        {
+            guard let index = arrangedViews.firstIndex(where: { view in
+                guard case let .item(item) = view.kind else { return false }
+                return item.uniqueIdentifier == representative
+            }) else { continue }
+            descriptors.append(
+                GroupDescriptor(
+                    memberIndices: [index],
+                    memberIdentifiers: members
+                )
+            )
+        }
+        return descriptors.sorted {
+            ($0.memberIndices.first ?? 0) < ($1.memberIndices.first ?? 0)
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        for memberIndices in groupedMemberIndices() {
+        for group in groupDescriptors() {
+            // Re-resolve members by identifier against the *current* arranged
+            // views. `memberIndices` are positions captured when the descriptor
+            // was built, and this bar re-lays-out several times a second while a
+            // live item changes width — so by the time the chrome is drawn those
+            // positions can name entirely different views. That is how a group
+            // holding only `com.bjango.istatmenus.status` ends up drawing its
+            // pocket around Tailscale, Dropbox and Wi-Fi. Identifiers cannot
+            // drift; positions can.
+            let memberIdentifiers = Set(group.memberIdentifiers)
+            let liveIndices = arrangedViews.indices.filter { index in
+                guard case let .item(item) = arrangedViews[index].kind else { return false }
+                return memberIdentifiers.contains(item.uniqueIdentifier)
+            }
             // A bundle's members may be scattered; draw one rounded background
             // per contiguous sub-run so the chrome never encloses foreign items
             // that happen to sit between members. One handle still moves them all.
-            for run in Self.contiguousRuns(of: memberIndices) {
+            for run in Self.contiguousRuns(of: liveIndices) {
                 let views = run.compactMap { arrangedViews.indices.contains($0) ? arrangedViews[$0] : nil }
                 guard let first = views.first else {
                     continue
@@ -450,13 +583,25 @@ final class LayoutBarContainer: NSView {
             arrangedViews.removeAll()
             return
         }
+        // Present the AUTHORED order, not the AX order.
+        //
+        // The cache is sorted by live AX position, and for an item macOS is not
+        // drawing those positions are frozen at whatever they were before
+        // concealment. A committed reorder (`setSectionOrder`) therefore never
+        // appeared here: the drop handler wrote the new order, the log showed
+        // the commit, and the preview kept rendering the phantom arrangement —
+        // "it still doesn't drag by the grip", 2026-08-01, while every commit
+        // succeeded. The controller's ordering is the same authority the drop
+        // handler writes, so the preview now shows the user's intent and the
+        // real bar follows wherever macOS honours the weights.
+        let orderedItems = appState.menuBarManager.sectionController?.ordered(items, in: section) ?? items
         let runningApplications = NSWorkspace.shared.runningApplications
         let runningBundleIdentifiers = Set(runningApplications.compactMap(\.bundleIdentifier))
         let littleSnitchRunning = runningBundleIdentifiers.contains(
             LayoutOpaqueSlotDescriptor.littleSnitchBundleIdentifier
         )
         suppressLittleSnitchUnresolvedSlot = LayoutOpaqueSlotDescriptor.shouldSuppressUnresolvedSlot(
-            in: items,
+            in: orderedItems,
             littleSnitchRunning: littleSnitchRunning,
             wasSuppressed: suppressLittleSnitchUnresolvedSlot
         )
@@ -472,21 +617,52 @@ final class LayoutBarContainer: NSView {
             positions = [:]
             opaqueSlot = nil
         }
-        let displayedItems = LayoutOpaqueSlotDescriptor.itemsForLayout(
-            items,
+        let layoutItems = LayoutOpaqueSlotDescriptor.itemsForLayout(
+            orderedItems,
             suppressUnresolvedSlot: suppressLittleSnitchUnresolvedSlot
         )
+        let groupedItems = gatheredGroupPresentation(
+            items: layoutItems,
+            groups: appState.settings.advanced.itemGroups
+        )
+        let presentation = collapsedGroupPresentation(
+            items: groupedItems,
+            groups: appState.settings.advanced.itemGroups
+        )
+        collapsedGroupMembersByRepresentative = presentation.membersByRepresentative
+        let displayedItems = presentation.items
 
         var newViews = [LayoutBarArrangedView]()
+        var claimedViewIdentities = Set<ObjectIdentifier>()
         let itemIdentifiers = displayedItems.map(\.uniqueIdentifier)
         let badgeIndex = appState.itemManager.newItemsBadgeIndex(in: section, itemIdentifiers: itemIdentifiers)
         for item in displayedItems {
-            if let existingView = arrangedViews.first(where: {
-                if case let .item(existingItem) = $0.kind {
-                    return existingItem == item
+            // Identity, not value equality. `MenuBarItem ==` includes `title`
+            // and `bounds`, both of which change several times a second for a
+            // live item, so a value-based test rebuilt every view on every cache
+            // publish — destroying tracking areas, tooltips and any in-flight
+            // press, and restarting the layout animation each time. That is the
+            // gyrating. The matched view has its `item` refreshed below so it
+            // does not stay pinned to the payload it was created with.
+            // Each existing view may be claimed at most once. `matchesIdentity`
+            // folds canonical namespace and title, so two live orderedItems can match
+            // the same view — and appending it twice puts one view object at two
+            // positions in `arrangedViews`. That is what produced duplicated
+            // icons in the Layout preview (1Password, the Thaw cube, battery,
+            // Wi-Fi appearing twice) and a group pocket drawn around the wrong
+            // run, since every index-based consumer then disagrees with reality.
+            if let existingIndex = arrangedViews.firstIndex(where: { view in
+                guard !claimedViewIdentities.contains(ObjectIdentifier(view)) else { return false }
+                if case let .item(existingItem) = view.kind {
+                    return existingItem.tag.matchesIdentity(of: item.tag)
                 }
                 return false
             }) {
+                let existingView = arrangedViews[existingIndex]
+                claimedViewIdentities.insert(ObjectIdentifier(existingView))
+                if let itemView = existingView as? LayoutBarItemView {
+                    itemView.item = item
+                }
                 newViews.append(existingView)
             } else {
                 let view = LayoutBarItemView(appState: appState, item: item)
@@ -531,8 +707,98 @@ final class LayoutBarContainer: NSView {
             let insertionIndex = adjustedBadgeIndex.clamped(to: newViews.startIndex ... newViews.endIndex)
             newViews.insert(badgeView, at: insertionIndex)
         }
+        // `arrangedViews.didSet` runs a full animated layout pass. Assigning an
+        // identical array on every cache publish therefore restarted a ~0.25 s
+        // implicit animation on every view several times a second, so nothing
+        // ever settled. Cache-driven passes also must not animate — only a
+        // user-initiated change should.
+        guard newViews != arrangedViews else { return }
+        shouldAnimateNextLayoutPass = false
         arrangedViews = newViews
+
+        // Temporary instrumentation for the Layout-preview "slivers" bug: one
+        // line per publish naming, for every arranged view, its object identity,
+        // the tag it is drawing, and the size of the image the cache holds for
+        // that tag. Two views reporting the same identity or the same image, or
+        // a size that does not match the item's own width, localises the fault
+        // to reuse / cache lookup / crop respectively — which four rounds of
+        // reasoning failed to separate.
+        if section == .visible, let traceState = self.appState {
+            let rows = arrangedViews.compactMap { view -> String? in
+                guard case let .item(item) = view.kind else { return nil }
+                let image = traceState.imageCache.image(for: item.tag)
+                let size = image.map { "\(Int($0.scaledSize.width))x\(Int($0.scaledSize.height))" } ?? "nil"
+                return "\(UInt(bitPattern: ObjectIdentifier(view).hashValue) % 10000)" +
+                    ":\(item.tag.tagIdentifier.suffix(28))" +
+                    " w=\(Int(item.bounds.width)) img=\(size)"
+            }
+            Self.layoutTraceLog.debug("layoutTrace [\(rows.joined(separator: " | "))]")
+        }
         newlyCreatedBadgeView?.animateAppearance()
+    }
+
+    /// Makes each authored group contiguous in the Layout preview without
+    /// changing Bjango's native status-item views or the persisted menu order.
+    /// The first member keeps the group's position; later members are gathered
+    /// directly behind it so Layout draws one pocket instead of fragments.
+    private func gatheredGroupPresentation(
+        items: [MenuBarItem],
+        groups: [MenuBarItemGroup]
+    ) -> [MenuBarItem] {
+        var result = items
+        for group in groups {
+            let members = result.filter { group.contains($0.tag.namespace) }
+            guard members.count >= 2,
+                  let insertionIndex = result.firstIndex(where: {
+                      $0.uniqueIdentifier == members[0].uniqueIdentifier
+                  })
+            else {
+                continue
+            }
+            let identifiers = Set(members.map(\.uniqueIdentifier))
+            result.removeAll { identifiers.contains($0.uniqueIdentifier) }
+            result.insert(contentsOf: members, at: insertionIndex)
+        }
+        return result
+    }
+
+    /// Folds every collapsed user group to its first live member in this
+    /// section. The retained item is only the editor's visual representative;
+    /// its group handle still carries every member identifier for moves.
+    private func collapsedGroupPresentation(
+        items: [MenuBarItem],
+        groups: [MenuBarItemGroup]
+    ) -> (items: [MenuBarItem], membersByRepresentative: [String: [String]]) {
+        var suppressed = Set<String>()
+        var membersByRepresentative = [String: [String]]()
+
+        // A group sitting in the Visible section is always drawn expanded,
+        // whatever its collapsed flag says. Collapsing is for the sections the
+        // user is not looking at directly — Hidden and Always Hidden, which is
+        // what the Thaw Bar shows. On the visible bar the members are the point:
+        // they are the live native items, and folding them behind a single
+        // representative hides the very thing the section exists to display.
+        // Collapse state is preserved, so moving the group back into Hidden
+        // restores the pocket.
+        guard section != .visible else {
+            return (items, membersByRepresentative)
+        }
+
+        for group in groups where group.isCollapsed {
+            let members = items.filter { group.contains($0.tag.namespace) }
+            guard let representative = members.first, members.count >= 2 else { continue }
+            let fullMemberIdentifiers = appState.map {
+                MenuBarItemGroupCoordinator.members(of: group, in: $0.itemManager)
+                    .map(\.uniqueIdentifier)
+            } ?? members.map(\.uniqueIdentifier)
+            membersByRepresentative[representative.uniqueIdentifier] = fullMemberIdentifiers
+            suppressed.formUnion(members.dropFirst().map(\.uniqueIdentifier))
+        }
+
+        return (
+            items.filter { !suppressed.contains($0.uniqueIdentifier) },
+            membersByRepresentative
+        )
     }
 
     /// Updates the positions of the container's arranged views using the

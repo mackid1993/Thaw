@@ -575,6 +575,95 @@ extension CGImage {
         }
         return context.isTransparent()
     }
+
+    /// Whether every pixel is within `tolerance` of every other — a flat patch
+    /// with no glyph, text, or edge anywhere in it.
+    ///
+    /// ``isTransparent(alphaThreshold:)`` is not enough to decide that a menu
+    /// bar item failed to draw. It only tests alpha, which works for captures
+    /// of the menu bar *hosting window* (a missing item leaves a hole). Items
+    /// that take the display-strip path — every third-party item, see
+    /// ``MenuBarItemImageCache/prefersDisplayStripCapture(for:)`` — are captured
+    /// off the screen instead, so a missing item reads as the **opaque menu bar
+    /// background**: alpha 255, and `isTransparent` returns false.
+    ///
+    /// Measured on macOS 27, 2026-07-31: after an assessment-mode reflow, iStat
+    /// Menus' five items kept correct AX bounds and sizes but drew nothing, and
+    /// the region was solid black. `post-restriction repair` logged
+    /// "no non-hiding-unsupported items parked or blank" on every pass and never
+    /// pulsed the assertion — the one recovery that exists for exactly this
+    /// symptom (see ``MenuBarSectionController/pulseRestrictionAfterReflow(liveItems:)``).
+    ///
+    /// Scans each of the four byte lanes independently and requires all of them
+    /// to be flat, which sidesteps needing to know whether the buffer is BGRA or
+    /// ARGB. A real item is a high-contrast glyph against the bar; anything with
+    /// content clears a tolerance this small immediately.
+    /// - Important: never reach for `dataProvider` here. The images this is
+    ///   called on come from `CGImage.cropping(to:)`, and a cropped image shares
+    ///   its parent's provider — asking for `.data` can materialize the *entire*
+    ///   parent bitmap (a full menu bar strip capture), and the parent's
+    ///   `bytesPerRow` does not describe the crop, so a naive scan reads the
+    ///   wrong pixels as well. The first version of this method did exactly
+    ///   that, once per item on every blank check (about 11 items, roughly every
+    ///   1.2 s), and froze the Mac hard enough to need a power cycle on
+    ///   2026-07-31. `isTransparent` gets away with the same shape only because
+    ///   its `alphaInfo` switch returns before it ever touches the provider.
+    ///
+    ///   Drawing into a small context owned here is bounded by the crop, always
+    ///   32-bit BGRA, and costs a few kilobytes.
+    nonisolated func isFeatureless(tolerance: UInt8 = 6) -> Bool {
+        guard width > 0, height > 0 else { return true }
+        // A menu bar item crop is tens of points square. Anything larger is not
+        // an item and is not worth scanning.
+        guard width * height <= 65536 else { return false }
+
+        let bytesPerPixel = 4
+        let rowBytes = width * bytesPerPixel
+        var buffer = [UInt8](repeating: 0, count: rowBytes * height)
+
+        let drew = buffer.withUnsafeMutableBytes { raw -> Bool in
+            guard let base = raw.baseAddress,
+                  let context = CGContext(
+                      data: base,
+                      width: width,
+                      height: height,
+                      bitsPerComponent: 8,
+                      bytesPerRow: rowBytes,
+                      space: CGColorSpaceCreateDeviceRGB(),
+                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue |
+                          CGBitmapInfo.byteOrder32Little.rawValue
+                  )
+            else {
+                return false
+            }
+            context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drew else { return false }
+
+        // Scan each byte lane independently — that sidesteps needing to know
+        // which lane is which — and require all four to be flat.
+        var minima = [UInt8](repeating: .max, count: 4)
+        var maxima = [UInt8](repeating: .min, count: 4)
+
+        for row in 0 ..< height {
+            let rowStart = row * rowBytes
+            for col in 0 ..< width {
+                let pixel = rowStart + col * bytesPerPixel
+                for lane in 0 ..< 4 {
+                    let value = buffer[pixel + lane]
+                    if value < minima[lane] { minima[lane] = value }
+                    if value > maxima[lane] { maxima[lane] = value }
+                }
+            }
+            // Bail as soon as any lane shows real contrast; a glyph usually
+            // trips this within the first few rows.
+            for lane in 0 ..< 4 where maxima[lane] - minima[lane] > tolerance {
+                return false
+            }
+        }
+        return true
+    }
 }
 
 // MARK: - Collection where Element == MenuBarItem

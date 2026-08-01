@@ -128,6 +128,13 @@ final class AppState: ObservableObject {
         hidEventManager.performSetup(with: self)
         diagLog.debug("setupTask: starting itemManager setup")
         await itemManager.performSetup(with: self)
+        if let sectionController = menuBarManager.sectionController {
+            MenuBarItemGroupCoordinator.reconcileSections(
+                groups: settings.advanced.itemGroups,
+                in: itemManager,
+                controller: sectionController
+            )
+        }
         diagLog.debug("setupTask: itemManager setup scheduled, invalidating menuBarHeightCache")
         NSScreen.invalidateMenuBarHeightCache()
         diagLog.debug("setupTask: starting imageCache setup")
@@ -265,6 +272,26 @@ final class AppState: ObservableObject {
                 self?.isDraggingMenuBarItem = isDragging
             }
             .store(in: &c)
+
+        // A group may be defined before every one of its native items has
+        // reached the cache. Reconcile again as the cache settles so a legacy
+        // or automatic-overflow split converges to one authored section.
+        Publishers.CombineLatest(
+            settings.advanced.$itemGroups,
+            itemManager.$itemCache
+        )
+        .debounce(for: .milliseconds(250), scheduler: DispatchQueue.main)
+        .sink { [weak self] groups, _ in
+            guard let self,
+                  let sectionController = menuBarManager.sectionController
+            else { return }
+            MenuBarItemGroupCoordinator.reconcileSections(
+                groups: groups,
+                in: itemManager,
+                controller: sectionController
+            )
+        }
+        .store(in: &c)
 
         Publishers.CombineLatest(
             navigationState.$isAppFrontmost,

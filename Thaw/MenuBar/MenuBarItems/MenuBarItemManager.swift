@@ -543,12 +543,61 @@ final class MenuBarItemManager: ObservableObject {
         var liveParkedIDs = parkedSetAndBarMidY(in: liveItems).parkedIDs
         let prePulseParked = pulseCandidates.filter { liveParkedIDs.contains($0.windowID) }
         let prePulseOnBand = pulseCandidates.filter { !liveParkedIDs.contains($0.windowID) }
-        let prePulseBlank = await appState.imageCache.itemsRenderingBlank(
-            among: prePulseOnBand,
-            displayID: displayID
-        )
+        // Only pay for the blank check when it can change the outcome. Since
+        // blanks no longer trigger a pulse (see below), computing them on every
+        // repair pass bought nothing but a full display-strip screen capture
+        // plus a per-item scan, several times a second. That cost is what turned
+        // a correctness bug in `CGImage.isFeatureless` into a hard machine
+        // freeze on 2026-07-31.
+        let prePulseBlank: Set<MenuBarItemTag>
+        if prePulseParked.isEmpty {
+            // Nothing is parked, so a pulse is not already decided — this is the
+            // case the blank check exists to report on. (The gating was inverted
+            // when first written: it computed blanks only when a pulse was
+            // guaranteed anyway, and skipped them exactly when they mattered.)
+            prePulseBlank = await appState.imageCache.itemsRenderingBlank(
+                among: prePulseOnBand,
+                displayID: displayID
+            )
+        } else {
+            prePulseBlank = []
+        }
         guard !Task.isCancelled else { return false }
-        let needsPulse = !prePulseParked.isEmpty || !prePulseBlank.isEmpty
+
+        // Blank items deliberately do NOT trigger a pulse.
+        //
+        // Every `applying restriction` is a whole-bar re-composite, and the
+        // re-composite is what loses iStat's hosting. Measured 2026-07-31, same
+        // build, same bar, only the number of concealed bundles varying:
+        //
+        //   concealed  restriction applications  iStat items left blank
+        //       0                 0                      0
+        //       1                 7                      2
+        //       4                25                      5
+        //
+        // Damage scales with the number of applications, so pulsing *because*
+        // items are blank is a feedback loop: pulse, re-composite, more blanks,
+        // pulse again. Detection is still worth having — it is what produced the
+        // table above — but it belongs in the log, not on the trigger.
+        //
+        // Parked items keep the pulse: that path was measured and works, and an
+        // item stranded off-band is not recoverable any other way.
+        if !prePulseBlank.isEmpty {
+            MenuBarItemManager.diagLog.info(
+                "post-restriction repair: \(prePulseBlank.count) on-band item(s) blank; not pulsing " +
+                    "(the re-composite is the cause — see the scaling table in this function)"
+            )
+        }
+        let needsPulse = !prePulseParked.isEmpty
+
+        // NOT WIRED IN — `MenuBarSectionController.nudgePositionsForRedraw` was
+        // tried here on 2026-07-31 and made things worse. Every write to
+        // `TrailingItemPreferredPositions` makes MenuBarAgent renormalize the
+        // *whole* dictionary (weights observed jumping 641 -> 19572 on an
+        // unrelated write), so a ±1 bump is not a local operation: the bar
+        // visibly reshuffles. David's report was "now it just moves around a
+        // lot". The blank items still did not draw. Keep the method for
+        // reference; do not re-wire it without solving the renormalization.
 
         if needsPulse, !Task.isCancelled, controller.pulseRestrictionAfterReflow(liveItems: liveItems) {
             MenuBarItemManager.diagLog.info(
@@ -1746,6 +1795,7 @@ final class MenuBarItemManager: ObservableObject {
         lastMoveOperationTimestamp = .now
         suppressSpatialOrderPersistenceAfterFailedApply = false
     }
+
 }
 
 // MARK: - Cache Gate
@@ -3080,11 +3130,23 @@ extension MenuBarItemManager {
 
         // Fallback: refresh on-screen items and pick the matching tag (prefer same windowID, then non-clone).
         let refreshed = await MenuBarItem.getMenuBarItems(option: .onScreen)
-        if let refreshedItem = refreshed.first(where: { $0.windowID == item.windowID && $0.tag == item.tag }) ??
-            refreshed.first(where: { $0.tag.matchesIgnoringWindowID(item.tag) && !$0.isSystemClone }) ??
-            refreshed.first(where: { $0.tag.matchesIgnoringWindowID(item.tag) }) ??
-            Self.nearestSameOwnerMatch(for: item, in: refreshed)
-        {
+        let byWindowID = refreshed.first { $0.windowID == item.windowID && $0.tag == item.tag }
+        let byTagNonClone = refreshed.first { $0.tag.matchesIgnoringWindowID(item.tag) && !$0.isSystemClone }
+        let byTag = refreshed.first { $0.tag.matchesIgnoringWindowID(item.tag) }
+        let byNearestOwner = Self.nearestSameOwnerMatch(for: item, in: refreshed)
+        if let refreshedItem = byWindowID ?? byTagNonClone ?? byTag ?? byNearestOwner {
+            let route = byWindowID != nil ? "windowID"
+                : byTagNonClone != nil ? "tag-nonclone"
+                : byTag != nil ? "tag"
+                : "nearest-owner"
+            if refreshedItem.tag != item.tag {
+                MenuBarItemManager.diagLog.warning(
+                    "moveTrace: resolved \(item.logString) to a DIFFERENT item " +
+                        "\(refreshedItem.logString) via \(route)"
+                )
+            } else {
+                MenuBarItemManager.diagLog.info("moveTrace: resolved \(item.logString) via \(route)")
+            }
             return refreshedItem.bounds
         }
 
@@ -3115,10 +3177,29 @@ extension MenuBarItemManager {
         in refreshed: [MenuBarItem]
     ) -> MenuBarItem? {
         guard !item.tag.isNonConcealableSystemItem else { return nil }
+        // The same reasoning that excludes system items excludes anything vended
+        // under the shared MenuBarAgent namespace.
+        //
+        // macOS 27 re-vends third-party items under `.menuBarAgent`, so
+        // `hasSameOwner` — namespace + PID — matches EVERY re-vended item at
+        // once, not just this app's. The positional tie-break then picks whatever
+        // is nearest `item.bounds.minX`, and for an item macOS has stopped
+        // drawing those bounds point at coordinates a *different, visible* item
+        // occupies. Reproduced 2026-08-01: dragging an iStat module moved
+        // Tailscale.
+        //
+        // A wrong answer here is worse than none: the caller moves, clicks or
+        // crops the wrong item, silently. Fail closed.
+        guard item.tag.namespace != .menuBarAgent else { return nil }
         guard item.bounds.width > 0 else { return nil }
         let tolerance = max(item.bounds.width, 24)
         return refreshed
             .filter { $0.hasSameOwner(as: item) && !$0.isSystemClone }
+            // Same canonical title as well as same owner. Volatile titles are
+            // already folded (`CPU #%`, `iStat.Weather`), so this distinguishes
+            // an app's own modules from each other and from a neighbour's, while
+            // still tolerating the live value that made the raw title unusable.
+            .filter { $0.tag.canonicalTitle == item.tag.canonicalTitle }
             .filter { abs($0.bounds.minX - item.bounds.minX) <= tolerance }
             .min { abs($0.bounds.minX - item.bounds.minX) < abs($1.bounds.minX - item.bounds.minX) }
     }
@@ -4797,6 +4878,55 @@ extension MenuBarItemManager {
         appState?.menuBarManager.sectionController?.notePreferredPositionsSelfWrite()
         requestMenuBarAgentPositionRefresh()
 
+        // Items macOS is not drawing verify against the dictionary, not the bar.
+        //
+        // `liveOrderSatisfiesDestination` polls AX-enumerated frames, and for a
+        // collateral-hidden item those are frozen fiction: the write applies,
+        // MenuBarAgent lays the bar out from it (neighbours visibly shift), and
+        // bounds-based verification still fails — measured 2026-08-01 as
+        // "Batch-reordered 3 item(s) via preferred positions" followed by
+        // "did not verify" on every attempt, ~4.3s each. Polling is pure cost
+        // for these items, so skip it and read back the order macOS actually
+        // lays out from. Gated on the pre-conceal warm store — precisely the
+        // items photographed because concealment would stop them rendering — so
+        // drawn items keep the stronger bounds verification and a mis-keyed
+        // write cannot self-certify.
+        //
+        // Weight convention, measured 2026-07-31: higher weight = further left
+        // (`module:Clock` = 0 is rightmost).
+        if PreConcealWarmStore.shared.contains(item.tag) {
+            let anchorAndSide: (MenuBarItem, Bool)? = switch destination {
+            case let .leftOfItem(a): (a, true)
+            case let .rightOfItem(a): (a, false)
+            default: nil
+            }
+            if let (anchor, wantLeft) = anchorAndSide {
+                let positions = RuntimePositionStore.currentPositions()
+                let existingKeys = Array(positions.keys)
+                let refreshedItems = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+                if let itemKey = RuntimePositionStore.resolveKey(
+                    for: item, existingKeys: existingKeys, positions: positions, liveItems: refreshedItems
+                ),
+                    let anchorKey = RuntimePositionStore.resolveKey(
+                        for: anchor, existingKeys: existingKeys, positions: positions, liveItems: refreshedItems
+                    ),
+                    let itemWeight = positions[itemKey],
+                    let anchorWeight = positions[anchorKey]
+                {
+                    let satisfied = wantLeft ? itemWeight > anchorWeight : itemWeight < anchorWeight
+                    MenuBarItemManager.diagLog.info(
+                        "Preferred-position dictionary check for \(item.logString): " +
+                            "itemWeight=\(itemWeight) anchorWeight=\(anchorWeight) " +
+                            "wantLeft=\(wantLeft) -> \(satisfied ? "FULFILLED" : "not fulfilled")"
+                    )
+                    if satisfied {
+                        lastMoveOperationTimestamp = .now
+                        return true
+                    }
+                }
+            }
+        }
+
         // Poll the live order until MenuBarAgent observes the synchronized write.
         let destinationSatisfied: ([MenuBarItem]) -> Bool = { items in
             RuntimeLayoutCoordinator.liveOrderSatisfiesDestination(
@@ -5080,6 +5210,24 @@ extension MenuBarItemManager {
     /// its status item element. Returns false (so the caller can fall back to
     /// a synthetic click) when the element cannot be resolved or the press fails.
     private func pressItemViaAccessibility(_ item: MenuBarItem) -> Bool {
+        // A concealed item must go through the reveal path, not a direct press.
+        //
+        // AX still vends children for a concealed item, and the identity match
+        // below will happily find and press the right one — but the item is not
+        // on screen, so the menu has nowhere to open and the click lands as
+        // silent nothing ("clicking an icon in the thaw bar does not work when
+        // it's in the group", 2026-08-01). Returning false routes the caller to
+        // reveal-click-conceal, where the item is drawn before it is pressed.
+        // The direct press remains for its intended case: an item that is
+        // undrawn only as collateral, which IS pressable in place.
+        if appState?.menuBarManager.sectionController?
+            .assertionConcealedIdentifiers.contains(item.uniqueIdentifier) == true
+        {
+            MenuBarItemManager.diagLog.debug(
+                "pressItemViaAccessibility: \(item.logString) is concealed; deferring to reveal path"
+            )
+            return false
+        }
         // Fall back to ownerPID so this works during startup before sourcePID
         // has been resolved.
         let pid = item.sourcePID ?? item.ownerPID
@@ -5098,9 +5246,53 @@ extension MenuBarItemManager {
 
         // A single status item is unambiguous. With several, match the one whose
         // AX frame lines up with this item's window so the right menu opens.
+        // Identity beats coordinates.
+        //
+        // For an item macOS is not drawing, the cached bounds are a frozen frame
+        // from before concealment, and a real neighbour usually sits within the
+        // 10pt tolerance of that fiction — the nearest-child match then presses
+        // the wrong app with full confidence ("when I go to interact with it in
+        // the Thaw Bar, it opens up a menu for a different item", 2026-08-01).
+        // Titles survive where geometry lies: canonicalise each child's AX title
+        // under the item's namespace and match the item's canonical title. Falls
+        // through to the coordinate paths when no title matches, so items with
+        // meaningless titles (Item-0) keep the existing behaviour.
+        if case let .string(namespaceValue) = MenuBarItemTag.canonicalNamespace(item.tag.namespace) {
+            let wanted = item.tag.canonicalTitle
+            if !wanted.isEmpty,
+               let match = children.first(where: { child in
+                   guard let rawTitle = AXHelpers.title(for: child) ?? AXHelpers.description(for: child),
+                         !rawTitle.isEmpty
+                   else { return false }
+                   return MenuBarItemTag.canonicalVolatileTitle(
+                       namespaceValue: namespaceValue, title: rawTitle
+                   ) == wanted
+               })
+            {
+                MenuBarItemManager.diagLog.info(
+                    "pressItemViaAccessibility: matched \(item.logString) by canonical title"
+                )
+                return AXHelpers.press(match)
+            }
+        }
+
+        // The tolerance applies even to a lone child.
+        //
+        // "A single status item is unambiguous" holds only when the children come
+        // from the item's own app. Under the shared `.menuBarAgent` namespace on
+        // macOS 27 they do not, so an unchecked single child pressed whatever was
+        // there — one route by which clicking iStat in the Thaw Bar opened a
+        // different app's menu.
         let target: UIElement
-        if children.count == 1 {
+        if children.count == 1,
+           let onlyFrame = AXHelpers.frame(for: children[0]),
+           onlyFrame.center.distance(
+               to: (Bridging.getWindowBounds(for: item.windowID) ?? item.bounds).center
+           ) <= 10
+        {
             target = children[0]
+        } else if children.count == 1 {
+            return false
         } else {
             // Use the item's live window bounds so the nearest-child match is not
             // thrown off by a stale cached position (which would make an Electron
@@ -5801,8 +5993,19 @@ extension MenuBarItemManager {
         // identity match; fall back to same-owner (a transient "Item-N" title
         // can change between enumerations), then to the original cached item.
         let liveItems = await MenuBarItem.getMenuBarItems(on: displayID, option: .onScreen)
+        // `hasSameOwner` compares namespace + PID, and on macOS 27 third-party
+        // items are re-vended under the shared `.menuBarAgent` namespace — so
+        // that fallback matches EVERY app at once, and `liveItems` is sorted by
+        // `bounds.minX`, meaning `.first` returns the leftmost item on the bar.
+        // Clicking iStat in the Thaw Bar opened whichever app happened to sit
+        // furthest left. `nearestSameOwnerMatch` already guards against exactly
+        // this; this site did not.
         let liveItem = liveItems.first { $0.hasSameIdentity(as: item) }
-            ?? liveItems.first { $0.hasSameOwner(as: item) }
+            ?? liveItems.first { candidate in
+                candidate.hasSameOwner(as: item) && !candidate.tag.isNonConcealableSystemItem
+                    && candidate.tag.namespace == item.tag.namespace
+                    && candidate.tag.canonicalTitle == item.tag.canonicalTitle
+            }
             ?? item
 
         do {
@@ -7211,6 +7414,34 @@ extension MenuBarItemManager {
 
         lastMacOS27OverflowRebalance = Date()
         let overflowSet = Set(overflowResult.overflowUIDs)
+        // Group cohesion is deliberately NOT applied here.
+        //
+        // It was, briefly: if the width budget ejected any member of a
+        // user-defined group, every member was ejected with it, on the argument
+        // that a group is one native presentation unit. That is right for an
+        // *authored* move — the user dragging a group between sections — and
+        // wrong for automatic overflow, which is a width mechanism and must shed
+        // the minimum.
+        //
+        // Measured 2026-07-31 on a bar with one group holding iStat Menus'
+        // five modules:
+        //
+        //   macOS 27 overflow budget: availableWidth=544.5 trailingLaneItemWidth=465.0
+        //   automatic overflow now conceals 5 item(s)
+        //
+        // The real deficit was ~31 pt. Expanding to the group evicted all five
+        // iStat modules, roughly 230 pt — and that overshoot is self-reversing:
+        // with 230 pt freed the budget has slack, the reducer readmits the
+        // group, the bar is over budget again, and it ejects it again. That
+        // oscillation is what was being seen as iStat "flashing", and on the
+        // assertion backend each cycle put `com.bjango.istatmenus.status` into
+        // `concealedBundles`, which is why iStat appeared to be dropped by the
+        // assertion. It was Thaw concealing it.
+        //
+        // If group cohesion is wanted for overflow, it has to eject the *whole
+        // group only when the group's own footprint is what needs shedding*,
+        // and it has to be stable against readmission. Do not restore the naive
+        // union.
         let overflowItems = visibleLive.filter { overflowSet.contains($0.uniqueIdentifier) }
         let didChange = controller.setOverflowHiddenItems(overflowItems)
         if didChange {

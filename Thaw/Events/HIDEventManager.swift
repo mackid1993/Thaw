@@ -1823,7 +1823,6 @@ extension HIDEventManager {
     private func handleMenuBarItemDragStop() {
         if isDraggingMenuBarItem {
             isDraggingMenuBarItem = false
-
             // Record the external move so caching is suppressed for 1s and order
             // restoration is suppressed for 2s,
             // then schedule a cache update to pick up the user's new item positions.

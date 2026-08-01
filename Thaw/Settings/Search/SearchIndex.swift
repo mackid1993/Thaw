@@ -70,6 +70,17 @@ nonisolated enum SearchIndex {
     /// macOS 27-only settings rows, appended when the sidebar search UI is available.
     private static let macOS27Entries: [SearchEntry] = [
         SearchEntry(
+            id: "advanced.itemGroups",
+            titleKey: "Item groups",
+            titleText: "Item groups",
+            descriptionText: "Keep selected apps' native menu bar items together when moving or hiding them.",
+            pane: .menuBarLayout,
+            sectionKey: "Item groups",
+            sectionText: "Item groups",
+            keywords: ["groups", "collapse", "expand", "iStat", "menu bar"],
+            property: .advanced("itemGroups")
+        ),
+        SearchEntry(
             id: "advanced.enableExperimentalSystemItemHiding",
             titleKey: "Allow hiding macOS system items",
             titleText: "Allow hiding macOS system items",

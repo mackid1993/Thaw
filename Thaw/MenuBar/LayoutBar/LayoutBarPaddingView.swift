@@ -101,12 +101,22 @@ final class LayoutBarPaddingView: NSView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard !isStabilizing else { return [] }
+        // The group-handle branch is checked BEFORE `isStabilizing`.
+        //
+        // A whole-group drop mutates order and assignment at drop time; it never
+        // reorders arranged views mid-drag, so the stabilisation flag has nothing
+        // to protect here. Gating on it meant a latched `isStabilizing` — it is
+        // only cleared inside the async `move()` task, so one incomplete move
+        // sticks it — rejected every group drop silently, with no log line at
+        // all. The drag would begin, freeze both bars via
+        // `canSetArrangedViews = false`, and never receive a drop: reported
+        // 2026-08-01 as "it grays out everything and sort of freezes".
         if sender.draggingSource is LayoutBarGroupHandleView {
             // The whole-group drop mutates order/assignment on drop rather than
             // reordering arranged views mid-drag, so just accept the move.
             return .move
         }
+        guard !isStabilizing else { return [] }
         // Freeze the destination's arrangedViews so that the cache refresh
         // triggered while the system move is in flight cannot overwrite the
         // mid-drag visual state. updateNewItemsPlacement at the end of move()
@@ -124,10 +134,11 @@ final class LayoutBarPaddingView: NSView {
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard !isStabilizing else { return [] }
+        // Group handles first, for the reason given in `draggingEntered`.
         if sender.draggingSource is LayoutBarGroupHandleView {
             return .move
         }
+        guard !isStabilizing else { return [] }
         return container.updateArrangedViewsForDrag(with: sender, phase: .updated)
     }
 
@@ -145,7 +156,13 @@ final class LayoutBarPaddingView: NSView {
     /// fires unconditionally), so `finishDrag` must stay idempotent.
     private func restoreArrangedViewsAfterDrag(from draggingInfo: NSDraggingInfo) {
         guard let draggingSource = draggingInfo.draggingSource as? LayoutBarArrangedView else {
+            // Includes the group handle, which is not an arranged view. Thaw the
+            // source container as well as the destination — otherwise a group
+            // drag that ends without a drop leaves the originating bar frozen.
             container.canSetArrangedViews = true
+            if let handle = draggingInfo.draggingSource as? LayoutBarGroupHandleView {
+                handle.sourceContainer?.canSetArrangedViews = true
+            }
             return
         }
         finishDrag(draggingSource, sourceContainer: draggingSource.oldContainerInfo?.container)
@@ -243,6 +260,46 @@ final class LayoutBarPaddingView: NSView {
             let physicalOrderExperimentalSystemItemHiding = experimentalSystemItemHiding &&
                 Self.allowsAnchoredSystemItemReordering(appState: container.appState)
 
+            // Crossing sections with any member moves the whole group. Within
+            // one section an expanded pocket keeps its native items
+            // individually arrangeable; the pocket grip moves the block.
+            // A collapsed pocket has no internal arrangement to expose, so its
+            // representative moves the whole block as well.
+            let traceMembers = crossSectionGroupMembers(
+                for: item,
+                sourceSection: sourceSection,
+                controller: controller
+            )
+            Self.diagLog.info(
+                "dragTrace: item=\(item.logString) sourceSection=\(sourceSection.rawValue) " +
+                    "container=\(container.section.rawValue) groupMembers=\(traceMembers?.count ?? -1) " +
+                    "collapsed=\(isCollapsedUserGroup(containing: item))"
+            )
+            if let groupMembers = traceMembers {
+                if sourceSection == container.section,
+                   !isCollapsedUserGroup(containing: item)
+                {
+                    cleanupDeferredToMoveTask = true
+                    return performGroupMemberReorder(
+                        groupMembers,
+                        sourceContainer: sourceContainer
+                    )
+                }
+
+                let groupDrag = LayoutBarGroupHandleView(
+                    sourceContainer: sourceContainer ?? container,
+                    sourceSection: sourceSection,
+                    memberIdentifiers: groupMembers.map(\.uniqueIdentifier)
+                )
+                if sourceSection == container.section {
+                    cleanupDeferredToMoveTask = true
+                    let dropX = container.convert(sender.draggingLocation, from: nil).x
+                    return performGroupHandleReorder(groupDrag, dropX: dropX)
+                }
+                let dropX = container.convert(sender.draggingLocation, from: nil).x
+                return performGroupHandleCrossSection(groupDrag, dropX: dropX)
+            }
+
             guard item.isPhysicallyOrderable(experimentalSystemItemHiding: physicalOrderExperimentalSystemItemHiding) else {
                 guard MenuBarSectionController.canAssign(
                     item,
@@ -290,21 +347,8 @@ final class LayoutBarPaddingView: NSView {
                 // section is reconciled separately on reveal, so just commit the
                 // new section + order here.
                 //
-                // "One section per group": when the dragged item belongs to a
-                // multi-item bundle group in its source section, relocate the whole
-                // group so a bundle's items never split across sections. The batch
-                // `setSection` appends every member to the target section's order in
-                // group order, so the per-item order commit is skipped in that case.
-                if let groupMembers = crossSectionGroupMembers(
-                    for: item,
-                    sourceSection: sourceSection,
-                    controller: controller
-                ) {
-                    controller?.setSection(container.section, items: groupMembers)
-                } else {
-                    controller?.setSection(container.section, item: item)
-                    controller?.setSectionOrder(from: orderedItems, for: container.section)
-                }
+                controller?.setSection(container.section, item: item)
+                controller?.setSectionOrder(from: orderedItems, for: container.section)
                 if let appState = container.appState {
                     Task { await appState.itemManager.cacheItemsRegardless(skipRecentMoveCheck: true) }
                 }
@@ -658,12 +702,14 @@ final class LayoutBarPaddingView: NSView {
         Self.layoutItemsForPersistence(from: arrangedViews)
     }
 
-    /// The members of the dragged item's bundle group in its source section, or
-    /// `nil` when the item is ungrouped (single-item bundle or not groupable).
+    /// The members of the dragged item's group in its source section, or `nil`
+    /// when the item is ungrouped (single-item bundle, no user group, or not
+    /// groupable).
     ///
-    /// Grouping is by bundle, so the whole bundle travels together on a
-    /// cross-section drop — honoring "one section per group" — even if its items
-    /// are not currently adjacent in the source section.
+    /// Grouping is by bundle and by the user's own group definitions, so the
+    /// whole cluster travels together on a cross-section drop — honoring "one
+    /// section per group" — even if its items are not currently adjacent in the
+    /// source section.
     private func crossSectionGroupMembers(
         for item: MenuBarItem,
         sourceSection: MenuBarSection.Name,
@@ -675,13 +721,36 @@ final class LayoutBarPaddingView: NSView {
         let managed = appState.itemManager.itemCache.managedItems(for: sourceSection)
         let sourceItems = controller?.ordered(managed, in: sourceSection) ?? managed
         let tags = sourceItems.map(\.tag)
-        guard let index = sourceItems.firstIndex(where: { $0.tag == item.tag }),
-              let group = MenuBarItemGrouping.group(containing: index, in: tags),
+        // Identity, not `==`: the dragged item's title may have ticked between
+        // the drag starting and this lookup, and a raw comparison would report
+        // the item as absent from its own section.
+        guard let index = sourceItems.firstIndex(where: { $0.tag.matchesIdentity(of: item.tag) }),
+              let group = MenuBarItemGrouping.group(
+                  containing: index,
+                  in: tags,
+                  userGroups: appState.settings.advanced.itemGroups
+              ),
               group.count >= 2
         else {
             return nil
         }
         return group.memberIndices.compactMap { sourceItems.indices.contains($0) ? sourceItems[$0] : nil }
+    }
+
+    /// Whether `item` is the representative of a collapsed user-defined
+    /// pocket. Implicit same-app clusters are always expanded.
+    private func isCollapsedUserGroup(containing item: MenuBarItem) -> Bool {
+        // Never collapsed while it is in the Visible section — matches
+        // `LayoutBarContainer.collapsedGroupPresentation`, so drag behavior and
+        // what is drawn agree. A visible group's members stay individually
+        // draggable within their pocket; a collapsed representative moves the
+        // whole block, and that only applies once the group is out of sight.
+        guard container.section != .visible else {
+            return false
+        }
+        return container.appState?.settings.advanced.itemGroups
+            .group(claiming: item.tag.namespace)?
+            .isCollapsed == true
     }
 
     // MARK: Group handle drops
@@ -701,7 +770,8 @@ final class LayoutBarPaddingView: NSView {
             return performGroupHandleReorder(handle, dropX: dropX)
         }
         defer { restoreAfterGroupDrop(handle) }
-        return performGroupHandleCrossSection(handle)
+        let dropX = container.convert(sender.draggingLocation, from: nil).x
+        return performGroupHandleCrossSection(handle, dropX: dropX)
     }
 
     /// Re-enables view updates on both the drop and source containers after a
@@ -709,6 +779,96 @@ final class LayoutBarPaddingView: NSView {
     private func restoreAfterGroupDrop(_ handle: LayoutBarGroupHandleView) {
         container.canSetArrangedViews = true
         handle.sourceContainer?.canSetArrangedViews = true
+    }
+
+    /// Reorders native members inside an expanded pocket without allowing the
+    /// dragged item to escape the pocket.
+    ///
+    /// AppKit has already rearranged the item previews under the cursor. Their
+    /// filtered order supplies the desired member order, while the authored
+    /// cache supplies the pocket's fixed position among every non-member item.
+    private func performGroupMemberReorder(
+        _ groupMembers: [MenuBarItem],
+        sourceContainer: LayoutBarContainer?
+    ) -> Bool {
+        guard let appState = container.appState else {
+            finishDrag(nil, sourceContainer: sourceContainer)
+            return false
+        }
+        let controller = appState.menuBarManager.sectionController
+        let cached = appState.itemManager.itemCache.managedItems(for: container.section)
+        let authored = controller?.ordered(cached, in: container.section) ?? cached
+        let memberIdentifiers = Set(groupMembers.map(\.uniqueIdentifier))
+        let visualMemberIdentifiers = orderedLayoutItems()
+            .map(\.uniqueIdentifier)
+            .filter(memberIdentifiers.contains)
+        // Every member must be present. Relaxing this to "reorder whatever is on
+        // screen" was tried on 2026-07-31 to fix "impossible to drag the group":
+        // it made the drag *do* something, but the wrong thing — a partial move
+        // scatters the group, so the pocket ends up interleaved with non-members
+        // ("the group gets populated with other items not in the group"). A
+        // refusal is the correct behavior; what was actually missing is the log
+        // below, since the old code returned false in silence and the pocket
+        // just snapped back with no explanation anywhere.
+        guard visualMemberIdentifiers.count == memberIdentifiers.count,
+              let firstMemberIndex = authored.firstIndex(where: {
+                  memberIdentifiers.contains($0.uniqueIdentifier)
+              })
+        else {
+            Self.diagLog.warning(
+                "Group member reorder refused: \(visualMemberIdentifiers.count) of " +
+                    "\(memberIdentifiers.count) member(s) present in the layout bar, " +
+                    "\(authored.contains { memberIdentifiers.contains($0.uniqueIdentifier) } ? "" : "none ")" +
+                    "anchored in the authored order"
+            )
+            finishDrag(nil, sourceContainer: sourceContainer)
+            return false
+        }
+
+        let liveByIdentifier = Dictionary(
+            authored.map { ($0.uniqueIdentifier, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let orderedMembers = visualMemberIdentifiers.compactMap { liveByIdentifier[$0] }
+        guard orderedMembers.count == memberIdentifiers.count else {
+            Self.diagLog.warning(
+                "Group member reorder refused: \(orderedMembers.count) of " +
+                    "\(memberIdentifiers.count) visual member(s) resolved against the authored cache"
+            )
+            finishDrag(nil, sourceContainer: sourceContainer)
+            return false
+        }
+
+        var reordered = authored.filter {
+            !memberIdentifiers.contains($0.uniqueIdentifier)
+        }
+        let insertionIndex = authored[..<firstMemberIndex]
+            .filter { !memberIdentifiers.contains($0.uniqueIdentifier) }
+            .count
+            .clamped(to: 0 ... reordered.count)
+        reordered.insert(contentsOf: orderedMembers, at: insertionIndex)
+
+        guard reordered.map(\.uniqueIdentifier) != authored.map(\.uniqueIdentifier) else {
+            finishDrag(nil, sourceContainer: sourceContainer)
+            return true
+        }
+
+        if macOS27SectionIsPhysicallyLive(container.section, controller: controller) {
+            let afterBlockIndex = insertionIndex + orderedMembers.count
+            moveGroupSequentially(
+                members: orderedMembers,
+                rightAnchor: afterBlockIndex < reordered.count ? reordered[afterBlockIndex] : nil,
+                leftAnchor: insertionIndex > 0 ? reordered[insertionIndex - 1] : nil,
+                sectionOrderToCommit: reordered,
+                sourceContainer: sourceContainer
+            )
+            return true
+        }
+
+        controller?.setSectionOrder(from: reordered, for: container.section)
+        Task { await appState.itemManager.cacheItemsRegardless(skipRecentMoveCheck: true) }
+        finishDrag(nil, sourceContainer: sourceContainer)
+        return true
     }
 
     /// Reorders a group as one contiguous block within its current section,
@@ -725,39 +885,82 @@ final class LayoutBarPaddingView: NSView {
             return false
         }
         let controller = appState.menuBarManager.sectionController
-        let orderedItems = orderedLayoutItems()
-        let identifiers = orderedItems.map(\.uniqueIdentifier)
+        // Resolve from the authored cache order, not the mutable arranged-view
+        // array. An individual member drag reorders its preview under the
+        // cursor before drop; using that transient array would mistake the one
+        // moved preview for the whole group's original position.
+        let cached = appState.itemManager.itemCache.managedItems(for: container.section)
+        let orderedItems = controller?.ordered(cached, in: container.section) ?? cached
 
         // Members in their current left-to-right order — the sequence the
         // gathered block must end in. Membership is by identifier, so a bundle
         // whose items are not adjacent still contributes every member.
         let memberIDSet = Set(handle.memberIdentifiers)
         let members = orderedItems.filter { memberIDSet.contains($0.uniqueIdentifier) }
+        let identifiers = orderedItems.map(\.uniqueIdentifier)
         guard members.count == handle.memberIdentifiers.count, members.count >= 2 else {
             // Some members are no longer present in this section (e.g. one was
             // pulled into another section); nothing to move as one block here.
+            //
+            // Logged because a refusal here is indistinguishable from a handle
+            // that never started dragging: the cluster simply snaps back. If a
+            // member's identifier drifted between the layout pass that built
+            // the handle and this drop — a live title that failed to
+            // canonicalize, say — this is where it surfaces.
+            Self.diagLog.warning(
+                "Group drop refused: handle carries \(handle.memberIdentifiers.count) member(s) " +
+                    "\(handle.memberIdentifiers), section has \(members.count) matching " +
+                    "\(members.map(\.uniqueIdentifier)) of \(identifiers)"
+            )
             restoreAfterGroupDrop(handle)
             return false
         }
 
         // Drop cursor position in the *original* array's index space.
-        let destination = groupHandleDestinationIndex(in: identifiers, dropX: dropX)
+        let destination = groupHandleDestinationIndex(
+            in: identifiers,
+            dropX: dropX,
+            excluding: memberIDSet
+        )
 
-        // Gather: remove every member, then insert the block so it begins at the
-        // drop cursor. Members sitting before the cursor shift the insertion left.
-        var reordered = orderedItems.filter { !memberIDSet.contains($0.uniqueIdentifier) }
-        let membersBefore = orderedItems.prefix(min(destination, orderedItems.count))
-            .filter { memberIDSet.contains($0.uniqueIdentifier) }
-            .count
-        let insertionIndex = (destination - membersBefore).clamped(to: 0 ... reordered.count)
-        reordered.insert(contentsOf: members, at: insertionIndex)
+        let memberIndices = orderedItems.indices.filter {
+            memberIDSet.contains(orderedItems[$0].uniqueIdentifier)
+        }
+        let reordered = MenuBarItemGrouping.moveMembers(
+            orderedItems,
+            memberIndices: memberIndices,
+            toIndexInOriginal: destination
+        )
+        guard let insertionIndex = reordered.firstIndex(where: {
+            memberIDSet.contains($0.uniqueIdentifier)
+        }) else {
+            restoreAfterGroupDrop(handle)
+            return false
+        }
 
         // Dropped where the block already sits — nothing to do.
         guard reordered.map(\.uniqueIdentifier) != identifiers else {
+            Self.diagLog.info("dragTrace reorder: no-op — block already at destination \(destination)")
             restoreAfterGroupDrop(handle)
             return true
         }
 
+        // Attempt the physical move, but bail the moment the backend says it
+        // cannot fulfil one.
+        //
+        // `moveGroupSequentially` used to run up to 4 passes x 5 members = 20
+        // sequential AX moves, each ~4.3s and each failing, while holding the
+        // Layout view dimmed and rejecting further drags — 74+ seconds of frozen
+        // UI, measured 2026-08-01. It discarded `move()`'s Bool, so "cannot be
+        // fulfilled" was invisible and the loop ground on regardless.
+        //
+        // Removing the move entirely was worse: the section order is committed
+        // below, but nothing observes authored order — the bar and the preview
+        // both follow physical position — so the group simply never moved.
+        //
+        // So: try, and give up fast. A fulfilled move reorders for real; an
+        // unfulfillable one costs one attempt instead of twenty and still
+        // commits the authored order.
         if macOS27SectionIsPhysicallyLive(container.section, controller: controller) {
             let firstIndex = insertionIndex
             let afterBlockIndex = firstIndex + members.count
@@ -768,7 +971,6 @@ final class LayoutBarPaddingView: NSView {
                 sectionOrderToCommit: reordered,
                 sourceContainer: handle.sourceContainer
             )
-            // The async task calls `finishDrag`, which restores view updates.
             return true
         }
 
@@ -837,45 +1039,82 @@ final class LayoutBarPaddingView: NSView {
             let liveOrder: @MainActor () -> [MenuBarItem] = {
                 appState.itemManager.itemCache.managedItems(for: section)
             }
+            // Identity, not raw tag equality. `memberOrder` was snapshotted when
+            // the drag began, and `==` compares the literal title and windowID —
+            // so an item whose title is a live value (iStat's `CPU 42°`, a
+            // network rate) stops matching itself the moment it ticks, which is
+            // the length of one AX move. Every member then resolved to nil, the
+            // remaining passes moved nothing, and `isPlaced` could never come
+            // true: the block was left half-gathered and the log said
+            // "did not fully converge after 4 passes". `matchesIdentity` compares
+            // canonical namespace and title, so it survives both the tick and a
+            // windowID change.
             let liveItem: @MainActor (MenuBarItemTag) -> MenuBarItem? = { tag in
-                liveOrder().first { $0.tag == tag }
+                liveOrder().first { $0.tag.matchesIdentity(of: tag) }
             }
             // Whether the members already sit contiguously, in order, immediately
             // beside the anchor — i.e., the block move is complete.
             let isPlaced: @MainActor () -> Bool = {
                 let live = liveOrder()
-                guard let anchorIndex = live.firstIndex(where: { $0.tag == anchorTag }) else {
+                guard let anchorIndex = live.firstIndex(where: { $0.tag.matchesIdentity(of: anchorTag) }) else {
                     return false
                 }
                 let start = insertToLeftOfAnchor ? anchorIndex - memberOrder.count : anchorIndex + 1
                 guard start >= 0, start + memberOrder.count <= live.count else {
                     return false
                 }
-                return memberOrder.indices.allSatisfy { live[start + $0].tag == memberOrder[$0] }
+                return memberOrder.indices.allSatisfy {
+                    live[start + $0].tag.matchesIdentity(of: memberOrder[$0])
+                }
             }
 
             // Repeat the placement pass until the whole block is contiguous; a
             // single AX move can transiently fail or lag the cache, which would
             // otherwise leave one member stranded outside the group.
             let maxPasses = 4
+            // Set when the backend reports it cannot express the move at all.
+            // Without this the loop ran every pass for every member — 20 moves
+            // at ~4.3s each, all failing, with the view dimmed throughout.
+            var backendCannotFulfil = false
+            // `isPlaced()` reads AX frames, which never update for collateral-
+            // hidden members — so a pass where EVERY move reported fulfilled is
+            // the success signal, or the loop grinds all four passes re-moving
+            // items that already landed.
+            var allFulfilled = false
             var pass = 0
-            while pass < maxPasses, !isPlaced() {
+            while pass < maxPasses, !isPlaced(), !backendCannotFulfil, !allFulfilled {
                 pass += 1
+                allFulfilled = true
                 for tag in orderedMemberTags {
+                    if backendCannotFulfil { break }
                     // Re-fetch both the member and the (stable) anchor so each
                     // move targets a current AX element.
                     guard let member = liveItem(tag), let anchor = liveItem(anchorTag) else {
+                        allFulfilled = false
                         continue
                     }
                     let destination: MenuBarItemManager.MoveDestination =
                         insertToLeftOfAnchor ? .leftOfItem(anchor) : .rightOfItem(anchor)
                     do {
-                        _ = try await appState.itemManager.move(
+                        let fulfilled = try await appState.itemManager.move(
                             item: member,
                             to: destination,
                             skipInputPause: true,
                             watchdogTimeout: MenuBarItemManager.layoutWatchdogTimeout
                         )
+                        if !fulfilled {
+                            allFulfilled = false
+                            // The position-only backend cannot express this
+                            // reorder. Every further attempt costs ~4.3s and
+                            // fails identically; stop and commit the authored
+                            // order instead of grinding.
+                            Self.diagLog.info(
+                                "Group reorder: backend could not fulfil the move for " +
+                                    "\(member.logString); committing order without physical move"
+                            )
+                            backendCannotFulfil = true
+                            break
+                        }
                     } catch {
                         Self.diagLog.error("Group reorder move failed for \(member.logString): \(error)")
                     }
@@ -900,12 +1139,15 @@ final class LayoutBarPaddingView: NSView {
     }
 
     /// Relocates every member of a group into the drop section.
-    private func performGroupHandleCrossSection(_ handle: LayoutBarGroupHandleView) -> Bool {
+    private func performGroupHandleCrossSection(
+        _ handle: LayoutBarGroupHandleView,
+        dropX: CGFloat
+    ) -> Bool {
         guard let appState = container.appState else {
             return false
         }
         let controller = appState.menuBarManager.sectionController
-        let sourceItems = appState.itemManager.itemCache.managedItems(for: handle.sourceSection)
+        let sourceItems = appState.itemManager.itemCache.managedItems
         let members = handle.memberIdentifiers.compactMap { identifier in
             sourceItems.first { $0.uniqueIdentifier == identifier }
         }
@@ -925,21 +1167,62 @@ final class LayoutBarPaddingView: NSView {
             return false
         }
 
+        let memberIdentifiers = Set(members.map(\.uniqueIdentifier))
+        let cachedTarget = appState.itemManager.itemCache.managedItems(for: container.section)
+        let orderedTarget = controller?.ordered(cachedTarget, in: container.section) ?? cachedTarget
+        let targetIdentifiers = orderedTarget.map(\.uniqueIdentifier)
+        let destination = groupHandleDestinationIndex(
+            in: targetIdentifiers,
+            dropX: dropX,
+            excluding: memberIdentifiers
+        )
+        var desiredOrder = orderedTarget.filter {
+            !memberIdentifiers.contains($0.uniqueIdentifier)
+        }
+        let insertionIndex = destination.clamped(to: 0 ... desiredOrder.count)
+        desiredOrder.insert(contentsOf: members, at: insertionIndex)
+        if container.section != .visible,
+           !Self.allowsAnchoredSystemItemReordering(appState: appState)
+        {
+            desiredOrder = Self.anchoredSystemItemsTrail(in: desiredOrder)
+        }
+
         controller?.setSection(container.section, items: members)
+        controller?.setSectionOrder(from: desiredOrder, for: container.section)
         Task { await appState.itemManager.cacheItemsRegardless(skipRecentMoveCheck: true) }
         return true
     }
 
     /// The insertion index (in `identifiers` space) for a group dropped at
     /// `dropX`, resolved from the nearest arranged item view.
-    private func groupHandleDestinationIndex(in identifiers: [String], dropX: CGFloat) -> Int {
-        guard let nearest = container.arrangedView(nearestTo: dropX, excludingBadge: true),
+    private func groupHandleDestinationIndex(
+        in identifiers: [String],
+        dropX: CGFloat,
+        excluding memberIdentifiers: Set<String>
+    ) -> Int {
+        let candidates = container.arrangedViews.filter { view in
+            guard !view.isNewItemsBadge else { return false }
+            guard case let .item(item) = view.kind else { return true }
+            return !memberIdentifiers.contains(item.uniqueIdentifier)
+        }
+        guard let nearest = candidates.min(by: {
+            abs($0.frame.midX - dropX) < abs($1.frame.midX - dropX)
+        }),
               case let .item(item) = nearest.kind,
               let index = identifiers.firstIndex(of: item.uniqueIdentifier)
         else {
+            Self.diagLog.info(
+                "dragTrace destination: no usable nearest view for dropX=\(Int(dropX)); " +
+                    "falling back to end (\(identifiers.count)) — candidates=\(candidates.count)"
+            )
             return identifiers.count
         }
-        return dropX > nearest.frame.midX ? index + 1 : index
+        let result = dropX > nearest.frame.midX ? index + 1 : index
+        Self.diagLog.info(
+            "dragTrace destination: dropX=\(Int(dropX)) nearest=\(item.logString) " +
+                "midX=\(Int(nearest.frame.midX)) index=\(index) -> destination=\(result)"
+        )
+        return result
     }
 
     private func orderedLayoutItemsForSectionOrder() -> [MenuBarItem] {
@@ -1128,6 +1411,23 @@ final class LayoutBarPaddingView: NSView {
             screen.hasNotch,
             let notch = screen.frameOfNotch
         else {
+            tearDownNotchPresentation()
+            return
+        }
+
+        // The marker only means something while the preview is spatially
+        // faithful. Its position is computed from screen geometry, but a strip
+        // that contains phantom items (assigned visible, not drawn by macOS)
+        // is laid out by authored order and is wider than the physical region —
+        // so the marker ends up overlapping real items and claiming they sit in
+        // the notch when they do not ("Superwhisper claims to be in the notch,
+        // but it's not — the boundaries are wrong", 2026-08-01). Hide it rather
+        // than draw a boundary that is false.
+        let hasPhantomItems = container.arrangedViews.contains { view in
+            guard case let .item(item) = view.kind else { return false }
+            return PreConcealWarmStore.shared.contains(item.tag)
+        }
+        guard !hasPhantomItems else {
             tearDownNotchPresentation()
             return
         }

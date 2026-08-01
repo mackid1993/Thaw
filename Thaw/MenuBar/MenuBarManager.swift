@@ -127,8 +127,25 @@ final class MenuBarManager: ObservableObject {
     /// temporary Thaw Bar fallback without mutating the user's per-display
     /// preference.
     func shouldUseIceBar(for displayID: CGDirectDisplayID) -> Bool {
-        appState?.settings.displaySettings.useIceBar(for: displayID) == true
-            || sectionController?.isNativeOverflowActive(on: displayID) == true
+        guard let appState else {
+            return sectionController?.isNativeOverflowActive(on: displayID) == true
+        }
+        let displaySettings = appState.settings.displaySettings
+        // Per-display settings win, but only where one actually exists for this
+        // display. `configuration(for:)` silently falls back to
+        // `globalConfiguration`, which defaults to `useIceBar: false` and is not
+        // fed by the general "Use the Thaw Bar" preference — so a display whose
+        // UUID has no stored entry (a new display, or a UUID that changed since
+        // the per-display migration ran) reported false no matter what the user
+        // had turned on. Symptom: clicking the Thaw icon reveals the items
+        // inline instead of opening the Thaw Bar, with both preferences visibly
+        // set to true. Observed 2026-07-31.
+        let hasPerDisplayConfiguration = Bridging.getDisplayUUIDString(for: displayID)
+            .map { displaySettings.configurations[$0] != nil } ?? false
+        let preference = hasPerDisplayConfiguration
+            ? displaySettings.useIceBar(for: displayID)
+            : appState.settings.general.useIceBar
+        return preference || sectionController?.isNativeOverflowActive(on: displayID) == true
     }
 
     /// Performs the initial setup of the menu bar manager.

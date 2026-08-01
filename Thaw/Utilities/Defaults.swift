@@ -268,6 +268,7 @@ extension Defaults {
         case enableExperimentalOverflowPrevention = "EnableExperimentalOverflowPrevention"
         case alwaysUseAppIconForMenuBarItems = "AlwaysUseAppIconForMenuBarItems"
         case menuBarOrderFulfillmentTimeout = "MenuBarOrderFulfillmentTimeout"
+        case menuBarItemGroups = "MenuBarItemGroups"
         case diagnosticAssessmentModeSceneProbes = "Thaw.diagnosticAssessmentModeSceneProbes"
         case diagnosticAssessmentModeProbeHiddenTriggerPress = "Thaw.diagnosticAssessmentModeProbeHiddenTriggerPress"
         case debugSimulateNotch = "Thaw.debugSimulateNotch"

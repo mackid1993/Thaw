@@ -19,17 +19,49 @@ import Foundation
 /// The type is intentionally pure and tag-driven so the grouping rules can be
 /// unit-tested without a live menu bar, `AppState`, or AppKit view tree.
 public enum MenuBarItemGrouping {
-    /// A set of same-bundle items within an ordered sequence.
+    /// A set of items within an ordered sequence that move and hide as one.
     public struct Group: Equatable, Sendable {
-        /// The shared namespace (bundle identity) of the members.
-        public let namespace: MenuBarItemTag.Namespace
+        /// What holds the members together.
+        public enum Identity: Hashable, Sendable {
+            /// Every item of one bundle — the implicit cluster Thaw presents
+            /// for a multi-item app in Layout.
+            case bundle(MenuBarItemTag.Namespace)
+            /// A ``MenuBarItemGroup`` the user defined, spanning one or more
+            /// bundles.
+            case user(UUID)
+        }
+
+        /// What holds the members together.
+        public let identity: Identity
         /// The indices of the members within the source array, ascending. The
         /// members are not necessarily contiguous.
         public let memberIndices: [Int]
 
-        public init(namespace: MenuBarItemTag.Namespace, memberIndices: [Int]) {
-            self.namespace = namespace
+        public init(identity: Identity, memberIndices: [Int]) {
+            self.identity = identity
             self.memberIndices = memberIndices
+        }
+
+        public init(namespace: MenuBarItemTag.Namespace, memberIndices: [Int]) {
+            self.init(identity: .bundle(namespace), memberIndices: memberIndices)
+        }
+
+        /// The shared bundle namespace of the members, or `nil` for a
+        /// user-defined group (whose members may span several bundles).
+        public var namespace: MenuBarItemTag.Namespace? {
+            guard case let .bundle(namespace) = identity else {
+                return nil
+            }
+            return namespace
+        }
+
+        /// The identifier of the user-defined group behind this cluster, or
+        /// `nil` when it is an implicit bundle group.
+        public var userGroupID: UUID? {
+            guard case let .user(id) = identity else {
+                return nil
+            }
+            return id
         }
 
         /// The number of items in the group.
@@ -72,26 +104,119 @@ public enum MenuBarItemGrouping {
     /// across two groups. Non-groupable items (system, Thaw, anchored,
     /// non-movable, non-string namespaces) are never members.
     public static func groups(in tags: [MenuBarItemTag]) -> [Group] {
+        groups(in: tags, userGroups: [])
+    }
+
+    /// Detects the clusters in a tag sequence, honoring the user's own group
+    /// definitions on top of the implicit same-bundle grouping.
+    ///
+    /// A namespace named by a user group is served by that group and never also
+    /// forms a bundle group, so no item is ever a member of two clusters. A
+    /// namespace claimed by more than one user group belongs to the first that
+    /// names it. Every other rule matches ``groups(in:)``: members need not be
+    /// adjacent, non-groupable items are never members, and a cluster needs at
+    /// least two members to exist — which is why a user group naming two
+    /// single-item apps is a group, while one naming a single single-item app
+    /// is not.
+    ///
+    /// Clusters are returned in left-to-right order of their first member.
+    public static func groups(in tags: [MenuBarItemTag], userGroups: [MenuBarItemGroup]) -> [Group] {
         var indicesByNamespace = [MenuBarItemTag.Namespace: [Int]]()
         var firstSeen = [MenuBarItemTag.Namespace: Int]()
 
         for (index, tag) in tags.enumerated() {
             guard isGroupable(tag) else { continue }
-            indicesByNamespace[tag.namespace, default: []].append(index)
-            if firstSeen[tag.namespace] == nil {
-                firstSeen[tag.namespace] = index
+            // Canonical: an app whose items arrive under two spellings of its
+            // namespace would otherwise be counted as two apps, and neither
+            // half would reach the two members a cluster needs.
+            let namespace = MenuBarItemTag.canonicalNamespace(tag.namespace)
+            indicesByNamespace[namespace, default: []].append(index)
+            if firstSeen[namespace] == nil {
+                firstSeen[namespace] = index
             }
         }
 
-        return indicesByNamespace
-            .filter { $0.value.count >= 2 }
-            .sorted { (firstSeen[$0.key] ?? 0) < (firstSeen[$1.key] ?? 0) }
-            .map { Group(namespace: $0.key, memberIndices: $0.value) }
+        // Resolve user groups first; the namespaces they claim are then off
+        // limits to bundle grouping.
+        var claimedNamespaces = Set<MenuBarItemTag.Namespace>()
+        var resolved = [Group]()
+
+        for userGroup in userGroups {
+            var members = [Int]()
+            for namespace in userGroup.namespaces.map(MenuBarItemTag.canonicalNamespace) {
+                guard !claimedNamespaces.contains(namespace),
+                      let indices = indicesByNamespace[namespace]
+                else {
+                    continue
+                }
+                claimedNamespaces.insert(namespace)
+                members.append(contentsOf: indices)
+            }
+            guard members.count >= 2 else {
+                // A group with fewer than two items present on the bar has
+                // nothing to hold together right now. Its claim is still
+                // recorded above so those namespaces do not fall back to
+                // bundle grouping and quietly contradict the user's intent.
+                continue
+            }
+            resolved.append(Group(identity: .user(userGroup.id), memberIndices: members.sorted()))
+        }
+
+        for (namespace, indices) in indicesByNamespace {
+            guard !claimedNamespaces.contains(namespace), indices.count >= 2 else {
+                continue
+            }
+            resolved.append(Group(namespace: namespace, memberIndices: indices))
+        }
+
+        // Each index belongs to exactly one cluster, so first members are
+        // distinct and this ordering is total — no dictionary iteration order
+        // leaks into the result.
+        return resolved.sorted { ($0.memberIndices.first ?? 0) < ($1.memberIndices.first ?? 0) }
     }
 
     /// The group containing the item at `index`, if that item is part of one.
     public static func group(containing index: Int, in tags: [MenuBarItemTag]) -> Group? {
-        groups(in: tags).first { $0.memberIndices.contains(index) }
+        group(containing: index, in: tags, userGroups: [])
+    }
+
+    /// The group containing the item at `index`, if that item is part of one,
+    /// honoring the user's own group definitions.
+    public static func group(
+        containing index: Int,
+        in tags: [MenuBarItemTag],
+        userGroups: [MenuBarItemGroup]
+    ) -> Group? {
+        groups(in: tags, userGroups: userGroups).first { $0.memberIndices.contains(index) }
+    }
+
+    /// Gathers the elements at `memberIndices` into one ordered block at a
+    /// drop cursor expressed in the original array's index space.
+    ///
+    /// Unlike ``moveBlock(_:sourceRange:toIndexInOriginal:)``, members may be
+    /// scattered. This is the primitive used when any item inside a group
+    /// pocket is dragged: every member is removed, their relative order is
+    /// preserved, and the complete block is inserted at the cursor.
+    public static func moveMembers<Element>(
+        _ elements: [Element],
+        memberIndices: [Int],
+        toIndexInOriginal destinationIndex: Int
+    ) -> [Element] {
+        let memberIndices = Array(Set(memberIndices))
+            .filter { elements.indices.contains($0) }
+            .sorted()
+        guard !memberIndices.isEmpty else { return elements }
+
+        let indexSet = Set(memberIndices)
+        let members = memberIndices.map { elements[$0] }
+        var remainder = elements.enumerated()
+            .filter { !indexSet.contains($0.offset) }
+            .map(\.element)
+        let removedBefore = memberIndices.lazy.filter { $0 < destinationIndex }.count
+        let insertionIndex = (destinationIndex - removedBefore)
+            .clamped(to: 0 ... remainder.count)
+        remainder.insert(contentsOf: members, at: insertionIndex)
+        return remainder
     }
 
     /// Moves the block of elements at `sourceRange` so it begins at

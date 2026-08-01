@@ -32,8 +32,26 @@ extension MenuBarItemManager {
         let key = "MenuBarItemManager.knownItemIdentifiers"
         let defaults = UserDefaults.standard
         if let stored = defaults.array(forKey: key) as? [String] {
-            knownItemIdentifiers = Set(stored.map(MenuBarItemTag.canonicalPersistentIdentifier))
+            let canonical = Set(stored.map(MenuBarItemTag.canonicalPersistentIdentifier))
+            knownItemIdentifiers = canonical.filter { !Self.isDeprecatedItemGroupProxyIdentifier($0) }
+            if knownItemIdentifiers.count != canonical.count {
+                persistKnownItemIdentifiers()
+            }
         }
+    }
+
+    /// Earlier experimental builds created Thaw-owned proxy status items for
+    /// groups. Those controls no longer exist, but their identifiers can remain
+    /// in the new-item cache and reappear as stale Layout entries. Never match
+    /// foreign items here: the namespace and title prefix are both Thaw-owned.
+    nonisolated static func isDeprecatedItemGroupProxyIdentifier(_ identifier: String) -> Bool {
+        guard let separator = identifier.firstIndex(of: ":") else { return false }
+        let namespace = String(identifier[..<separator])
+        guard Constants.isThawOwnedBundleIdentifier(namespace) else {
+            return false
+        }
+        let title = identifier[identifier.index(after: separator)...]
+        return title.hasPrefix("Thaw.ItemGroup.")
     }
 
     func persistKnownItemIdentifiers() {

@@ -142,6 +142,13 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
         /// The successfully captured images.
         var images = [MenuBarItemTag: CapturedImage]()
 
+        /// The native overflow control's own glyph, cropped from the same strip
+        /// capture as the item images, when its bounds were known this pass.
+        /// Used by the merge sites to invalidate any cached item image that is
+        /// pixel-identical to the chevron — the self-healing that used to hang
+        /// off the width heuristic before that was (correctly) removed.
+        var overflowControlImage: CapturedImage?
+
         /// The menu bar items excluded from the capture.
         var excluded = [MenuBarItem]()
 
@@ -893,6 +900,19 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
                 continue
             }
 
+            // Don't photograph the screen while the user is working in another
+            // app. Each tick takes two full-display ScreenCaptureKit frames
+            // (roughly 3456×80 and 3456×66 at 2×), four times a second at the
+            // default refresh interval, and that starves any other process
+            // running a capture session — reported repeatedly on 2026-07-31 as
+            // Snagit freezing whenever a Thaw settings surface was left open in
+            // the background. A surface that is open but not frontmost is not
+            // being looked at, so its glyphs can wait; the pane refreshes on
+            // reactivation.
+            guard nav.isAppFrontmost || nav.isIceBarPresented else {
+                continue
+            }
+
             // Hoisted: these are tick-global, not per-section.
             if appState.itemManager.lastMoveOperationOccurred(within: .seconds(2)) {
                 continue
@@ -1163,15 +1183,30 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
         let thirdPartyItems = items.filter { Self.prefersDisplayStripCapture(for: $0.tag) }
 
         var blankTags = Set<MenuBarItemTag>()
-        if !systemItems.isEmpty,
-           let capture = await ScreenCapture.captureMenuBarHostingWindowAsync(displayID: displayID)
-        {
-            blankTags.formUnion(Self.blankTags(in: systemItems, from: capture))
+        if !systemItems.isEmpty {
+            if let capture = await ScreenCapture.captureMenuBarHostingWindowAsync(displayID: displayID) {
+                // Hosting-window captures have a transparent background, so a
+                // missing item leaves a genuine hole. Alpha is the right and
+                // only safe test here.
+                blankTags.formUnion(Self.blankTags(in: systemItems, from: capture, treatFeaturelessAsBlank: false))
+            } else {
+                Self.diagLog.debug("itemsRenderingBlank: hosting-window capture failed for \(systemItems.count) system item(s)")
+            }
         }
-        if !thirdPartyItems.isEmpty,
-           let capture = await ScreenCapture.captureMenuBarDisplayStripAsync(displayID: displayID)
-        {
-            blankTags.formUnion(Self.blankTags(in: thirdPartyItems, from: capture))
+        if !thirdPartyItems.isEmpty {
+            if let capture = await ScreenCapture.captureMenuBarDisplayStripAsync(displayID: displayID) {
+                // Display-strip captures come off the screen and are opaque, so
+                // an item that failed to draw reads as flat menu bar background,
+                // never as transparent. See `CGImage.isFeatureless`.
+                let blanks = Self.blankTags(in: thirdPartyItems, from: capture, treatFeaturelessAsBlank: true)
+                Self.diagLog.debug(
+                    "itemsRenderingBlank: display strip — \(blanks.count)/\(thirdPartyItems.count) blank" +
+                        (blanks.isEmpty ? "" : ": \(blanks.map(\.tagIdentifier).sorted().joined(separator: ", "))")
+                )
+                blankTags.formUnion(blanks)
+            } else {
+                Self.diagLog.debug("itemsRenderingBlank: display-strip capture failed for \(thirdPartyItems.count) item(s)")
+            }
         }
         return blankTags
     }
@@ -1179,7 +1214,8 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
     @available(macOS 27, *)
     static nonisolated func blankTags(
         in items: [MenuBarItem],
-        from capture: ScreenCapture.MenuBarHostingCapture
+        from capture: ScreenCapture.MenuBarHostingCapture,
+        treatFeaturelessAsBlank: Bool = false
     ) -> Set<MenuBarItemTag> {
         let composite = capture.image
         let windowFrame = capture.windowFrame
@@ -1201,7 +1237,15 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
             else {
                 continue
             }
-            if croppedImage.isTransparent() {
+            // Transparency alone misses the display-strip case: those captures
+            // come off the screen, so an item that failed to draw reads as the
+            // opaque menu bar background rather than as a hole. See
+            // ``CGImage/isFeatureless(tolerance:)`` for the measurement that
+            // showed iStat's items sitting blank while this returned false and
+            // the assertion pulse never fired.
+            if croppedImage.isTransparent() ||
+                (treatFeaturelessAsBlank && croppedImage.isFeatureless())
+            {
                 blankTags.insert(item.tag)
             }
         }
@@ -1232,7 +1276,41 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
         _ cropRect: CGRect,
         cropRectOwners: [CGRect: MenuBarItemTag]
     ) -> MenuBarItemTag? {
-        cropRectOwners[cropRect]
+        if let exact = cropRectOwners[cropRect] {
+            return exact
+        }
+        // Exact equality is too strict. Two items whose AX bounds have drifted
+        // apart by a fraction of a point produce *different* rects over almost
+        // the same pixels, so each one's image contains the other's glyph — the
+        // Layout preview then shows the same icon twice, often with a sliver of
+        // a neighbour attached. Reported 2026-07-31: the Thaw cube, AlDente's
+        // "90%", the battery and Wi-Fi all rendered twice.
+        //
+        // Treat substantial overlap as the same claim. A legitimate neighbour
+        // abuts its sibling and shares at most an edge, so half the smaller
+        // area is far above anything adjacency produces.
+        // Near-identity, with a small ABSOLUTE tolerance — not a fraction of
+        // area. An overlap ratio was tried first and was far too aggressive:
+        // iStat's five modules sit shoulder to shoulder and are narrow (22–59 pt),
+        // so ordinary adjacency cleared a 50%-of-the-smaller-rect test and all
+        // five were rejected into the app-icon fallback — the pocket filled with
+        // repeated iStat logos instead of the live readouts.
+        //
+        // The defect being caught is sub-point drift between two items that
+        // resolve to essentially the same rect, so the tolerance belongs at that
+        // scale.
+        guard !cropRect.isNull, !cropRect.isEmpty else { return nil }
+        let tolerance: CGFloat = 2
+        for (rect, tag) in cropRectOwners {
+            if abs(rect.minX - cropRect.minX) <= tolerance,
+               abs(rect.minY - cropRect.minY) <= tolerance,
+               abs(rect.width - cropRect.width) <= tolerance,
+               abs(rect.height - cropRect.height) <= tolerance
+            {
+                return tag
+            }
+        }
+        return nil
     }
 
     @available(macOS 27, *)
@@ -1345,9 +1423,44 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
         _ itemsWithBounds: [(item: MenuBarItem, bounds: CGRect)],
         scale _: CGFloat,
         displayID: CGDirectDisplayID,
-        validateFreshBounds: Bool
+        validateFreshBounds: Bool,
+        trustBounds: Bool = false
     ) async -> CaptureResult {
         guard !itemsWithBounds.isEmpty else { return CaptureResult() }
+
+        // Items the assertion has concealed are not on screen at all, so there
+        // is nothing to photograph: every attempt burns a full-width
+        // ScreenCaptureKit frame, crops garbage out of whatever now occupies
+        // those coordinates, and repeats on the next tick. With the icon refresh
+        // interval at 0.25 s that is eight full-display captures a second of
+        // pure waste — enough to contend with any other app running a capture
+        // session (reported 2026-07-31: "the menu bar is causing Snagit to
+        // hang") and enough to fill the Layout preview with duplicated and
+        // chevron-contaminated crops.
+        //
+        // Only skipped while the assertion is the active hider. Under position
+        // hiding a "hidden" item is still drawn — parked off to one side — so it
+        // remains capturable and must keep refreshing.
+        let concealed = await MainActor.run { () -> Set<String> in
+            guard let controller = self.appState?.menuBarManager.sectionController else {
+                return []
+            }
+            // What the assertion is holding *right now*, not what is assigned
+            // hidden. Revealing the hidden section — which is what opening the
+            // Thaw Bar does — releases the concealment while the assignment
+            // stays `.hidden`, and those items are then on screen and must be
+            // captured, or the Thaw Bar shows them blank.
+            return controller.assertionConcealedIdentifiers
+        }
+        let itemsWithBounds = itemsWithBounds.filter {
+            !concealed.contains($0.item.uniqueIdentifier)
+        }
+        guard !itemsWithBounds.isEmpty else {
+            MenuBarItemImageCache.diagLog.debug(
+                "axBoundsCapture: all \(concealed.count) candidate(s) are concealed; skipping screenshot"
+            )
+            return CaptureResult()
+        }
 
         let captureBand = await MainActor.run { () -> (frame: CGRect, menuMaxX: CGFloat?) in
             guard let screen = NSScreen.screens.first(where: { $0.displayID == displayID }) else {
@@ -1477,6 +1590,26 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
         }.value
         let overflowBounds = preCaptureOverflowBounds + postCaptureOverflowBounds
 
+        // Photograph the chevron itself while we have the strip in hand. A crop
+        // that landed on the `\u{00BB}` and got cached as an item's glyph has no
+        // provenance to betray it later; the only reliable detector is the
+        // chevron's own current pixels, compared at the merge sites.
+        if let stripCapture, let chevronBounds = overflowBounds.first(where: { !$0.isEmpty }) {
+            let frame = stripCapture.windowFrame
+            let scale = stripCapture.scale
+            let raw = CGRect(
+                x: (chevronBounds.minX - frame.minX) * scale,
+                y: (chevronBounds.minY - frame.minY) * scale,
+                width: chevronBounds.width * scale,
+                height: chevronBounds.height * scale
+            ).integral
+            let imageBounds = CGRect(x: 0, y: 0, width: stripCapture.image.width, height: stripCapture.image.height)
+            let clamped = raw.intersection(imageBounds)
+            if !clamped.isNull, !clamped.isEmpty, let cg = stripCapture.image.cropping(to: clamped) {
+                result.overflowControlImage = CapturedImage(cgImage: cg, scale: scale)
+            }
+        }
+
         // Track crop rects already emitted in this pass. On macOS 27, collapsed
         // or overflow-collapsed items can share identical AX bounds; without
         // dedup, the same composite pixels get stored under each item's
@@ -1499,6 +1632,7 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
                 validateFreshBounds: validateFreshBounds,
                 postCaptureBoundsByID: postCaptureBoundsByID,
                 overflowBounds: overflowBounds,
+                trustBounds: trustBounds,
                 cropRectOwners: &hostingCropRectOwners,
                 into: &result
             )
@@ -1517,6 +1651,7 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
                 validateFreshBounds: validateFreshBounds,
                 postCaptureBoundsByID: postCaptureBoundsByID,
                 overflowBounds: overflowBounds,
+                trustBounds: trustBounds,
                 cropRectOwners: &stripCropRectOwners,
                 into: &result
             )
@@ -1535,6 +1670,7 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
         validateFreshBounds: Bool,
         postCaptureBoundsByID: [String: CGRect],
         overflowBounds: [CGRect],
+        trustBounds: Bool = false,
         cropRectOwners: inout [CGRect: MenuBarItemTag],
         into result: inout CaptureResult
     ) {
@@ -1543,7 +1679,74 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
         let scale = capture.scale
         let imageBounds = CGRect(x: 0, y: 0, width: composite.width, height: composite.height)
 
+        // Menu bar items are laid out side by side and never overlap. Any pair
+        // whose reported frames do overlap horizontally means at least one of
+        // those frames is fiction — a stale read, or bounds for an item macOS is
+        // no longer drawing (which is what happens to iStat Menus while the
+        // assertion collaterally hides it). Cropping a fictional frame lifts a
+        // slice of whichever real item occupies those pixels: the duplicated
+        // glyphs and torn edges in the Layout preview.
+        //
+        // The narrow-crop guard below only catches the case where the bad frame
+        // is implausibly *small*. A bad frame that is wide passes it and does
+        // more damage, so reject on the geometry invariant instead of on size.
+        // Both members of an overlapping pair are dropped — there is no way to
+        // tell which one is the liar — and each keeps its previous glyph.
+        var overlappingIdentifiers = Set<String>()
+        // During the pre-conceal warm nothing is concealed yet, so no frame can be
+        // phantom and these guards have nothing to catch — they only misfire on
+        // legitimately narrow or tightly-packed items (iStat's CPU temperature
+        // reports 14pt while genuinely drawn).
+        if !trustBounds {
+        for (indexA, candidateA) in candidates.enumerated() {
+            for candidateB in candidates[candidates.index(after: indexA)...] {
+                let a = candidateA.bounds
+                let b = candidateB.bounds
+                // Adjacent real items routinely overlap by a point or two —
+                // shared edges, padding, integral rounding. Measured on this
+                // Mac: KelvinShift 1029-1104 against superwhisper 1000-1031, a
+                // 2pt overlap between two entirely legitimate neighbours. A 1pt
+                // threshold rejected both and every item fell back to its app
+                // icon. A *phantom* frame overlaps by a whole item's width (a
+                // 14pt frame sitting inside a 22pt Wi-Fi glyph), so the signal
+                // is an order of magnitude clear of the noise.
+                let overlap = min(a.maxX, b.maxX) - max(a.minX, b.minX)
+                guard overlap > 6 else { continue }
+                // Drop only the frame CONTAINED WITHIN the other, not both.
+                // A phantom frame sits inside a real neighbour's span; dropping
+                // the pair punished the innocent item too — measured at four
+                // healthy items lost per pass out of seven non-iStat candidates.
+                // Legitimate adjacency peaks around 2pt, so containment is a
+                // clean discriminator.
+                if a.minX >= b.minX - 1, a.maxX <= b.maxX + 1 {
+                    overlappingIdentifiers.insert(candidateA.item.uniqueIdentifier)
+                } else if b.minX >= a.minX - 1, b.maxX <= a.maxX + 1 {
+                    overlappingIdentifiers.insert(candidateB.item.uniqueIdentifier)
+                } else {
+                    overlappingIdentifiers.insert(candidateA.item.uniqueIdentifier)
+                    overlappingIdentifiers.insert(candidateB.item.uniqueIdentifier)
+                }
+            }
+        }
+        }
+        if !overlappingIdentifiers.isEmpty {
+            MenuBarItemImageCache.diagLog.debug(
+                "axBoundsCapture: \(overlappingIdentifiers.count) item(s) report overlapping " +
+                    "frames; dropping their crops as untrustworthy"
+            )
+        }
+
         for (item, bounds) in candidates {
+            if PreConcealWarmStore.shared.contains(item.tag) {
+                // Already photographed while it was drawable, and unreachable
+                // now. Excluded WITHOUT invalidating, so the warm glyph stands.
+                result.excluded.append(item)
+                continue
+            }
+            if overlappingIdentifiers.contains(item.uniqueIdentifier) {
+                result.excluded.append(item)
+                continue
+            }
             if shouldSkipCapture(for: item) {
                 result.excluded.append(item)
                 continue
@@ -1605,6 +1808,34 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
             )
             let expectedCropRect = rawCropRect.integral
             let cropRect = Self.captureCropRect(expected: expectedCropRect, imageBounds: imageBounds)
+            // Temporary instrumentation: the Layout preview has been drawing
+            // some items' neighbours instead of their own glyph, with what looks
+            // like a fixed horizontal offset. Log the inputs so the derivation
+            // can be checked against reality rather than reasoned about.
+            // Never photograph an item that is not on screen.
+            //
+            // The crop derivation is correct — `crop.minX == bounds.minX * scale`
+            // exactly, verified against live numbers on 2026-07-31. The failure
+            // is upstream of it: when the assertion collaterally hides an app
+            // (macOS 27 drops iStat Menus whenever any bundle is concealed),
+            // MenuBarAgent still reports AX bounds for the items it is no longer
+            // rendering. Everything actually drawn is shifted left of its
+            // reported position, so cropping at the reported bounds photographs
+            // whichever neighbour really occupies those pixels — which is why
+            // iStat's slots in Layout showed the Thaw cube, AlDente's "90%",
+            // Wi-Fi and 1Password, each of which also rendered correctly in its
+            // own slot further right.
+            //
+            // `isOnScreen` comes from the item's window, not from AX, so it
+            // still reports the truth when the AX layout is fiction.
+            guard item.isOnScreen else {
+                MenuBarItemImageCache.diagLog.debug(
+                    "axBoundsCapture: \(item.logString) is off screen; skipping crop " +
+                        "(its AX bounds describe a layout that is not being drawn)"
+                )
+                result.excluded.append(item)
+                continue
+            }
 
             guard Self.isCompleteCrop(expected: expectedCropRect, clamped: cropRect) else {
                 // Native-hidden / overflowed items sit mostly outside the capture
@@ -1711,13 +1942,33 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
             // chevron region, producing a narrow, non-blank crop that sails
             // through every validation above. Detect and reject it so the
             // app-icon fallback takes over instead of showing "double arrows".
-            if bounds.width < Self.minimumTrustedGlyphWidth, !item.tag.isLayoutAnchoredSystemItem {
+            //
+            // Only meaningful while a native overflow control actually exists.
+            // With the assertion backend and nothing parked there is no `»` on
+            // screen, so a narrow crop cannot be contaminated by it — it is
+            // simply a narrow item. iStat Menus' CPU-temperature module crops to
+            // 14.0 pt, one point under the threshold, and was being rejected
+            // about three times a second: no image, permanent app-icon fallback,
+            // which is what "the icons are still all corrupted, at least for
+            // iStats" looks like. Measured 2026-07-31.
+            // A crop narrower than a real glyph is a bad bound, not a small item.
+            //
+            // This guard was removed earlier on 2026-07-31 on the belief that
+            // iStat Menus' CPU-temperature module is legitimately 14 pt wide.
+            // It is not — that module is a wide double icon, so a 14 pt bound
+            // means AX handed back a frame that does not describe the item, and
+            // cropping it yields a sliver of whatever sits at those coordinates.
+            // Those slivers are exactly what the removal produced.
+            //
+            // Ungated: chevron bleed was only ever one source of a bad narrow
+            // bound. A stale or torn AX frame is another, and it needs no
+            // overflow control on screen to happen.
+            if !trustBounds, bounds.width < Self.minimumTrustedGlyphWidth, !item.tag.isLayoutAnchoredSystemItem {
                 MenuBarItemImageCache.diagLog.debug(
-                    "axBoundsCapture: rejecting suspiciously narrow crop " +
-                        "(\(bounds.width)pt) for \(item.logString); likely overflow chevron bleed"
+                    "axBoundsCapture: rejecting implausibly narrow crop " +
+                        "(\(bounds.width)pt) for \(item.logString); keeping prior image"
                 )
                 result.excluded.append(item)
-                result.invalidatedTags.insert(item.tag)
                 continue
             }
 
@@ -1865,6 +2116,14 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
                 axItems,
                 scale: scale,
                 displayID: displayID,
+                // NOT unconditional. Measured 2026-08-01: with this forced on,
+                // "bounds changed while capturing" fired EIGHT times per pass
+                // against one each from the narrow-crop, overlap and duplicate
+                // guards combined. Live items move by more than the 0.5pt
+                // tolerance on essentially every capture, so the check rejected
+                // most of the bar every pass and each rejection renders as the
+                // owning app's icon. The race it detects is real; discarding
+                // eight good crops to catch it is not a trade worth making.
                 validateFreshBounds: freshBounds
             )
         }
@@ -2396,6 +2655,65 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
     /// Updates the cache for the given sections, without checking whether
     /// caching is necessary.
     @MainActor
+    /// Captures `items` immediately, while they are still on screen, and stores
+    /// the results.
+    ///
+    /// Called from ``MenuBarSectionController`` just before an assertion apply
+    /// conceals them. After that apply the glyphs are unreachable — the item is
+    /// not drawn, and on macOS 27 the collateral bug can stop a *neighbouring*
+    /// app rendering too — so this is the last instant a correct picture exists.
+    /// Warming the cache here is what lets the Thaw Bar open without revealing
+    /// and re-concealing everything to take photographs.
+    /// Tags photographed while still drawn, immediately before the first
+    /// concealing apply.
+    ///
+    /// These items cannot be captured again this session: macOS 27 stops
+    /// rendering them the moment anything is concealed, so every later attempt
+    /// crops phantom coordinates and fails — 42 narrow-crop and 36 overlap
+    /// rejections were measured in a single run, and the failing paths
+    /// invalidate the cache entry, destroying the one good glyph seconds after
+    /// it was taken. A warm glyph is final: stop trying, and stop losing it.
+    private var preConcealWarmedTags: Set<MenuBarItemTag> {
+        get { PreConcealWarmStore.shared.tags }
+        set { PreConcealWarmStore.shared.tags = newValue }
+    }
+
+    func captureBeforeConceal(items: [MenuBarItem], completion: (() -> Void)? = nil) {
+        guard #available(macOS 27, *), !items.isEmpty else { return }
+        Task { [weak self] in
+            guard let self, let appState = self.appState else { return }
+            let displayID = appState.itemManager.itemCache.displayID
+                ?? CGMainDisplayID()
+            let scale = NSScreen.screens.first { $0.displayID == displayID }?.backingScaleFactor
+                ?? NSScreen.main?.backingScaleFactor
+                ?? 2
+            // Take a couple of points of margin on each side.
+            //
+            // AX bounds hug the glyph, but macOS renders it with a little
+            // breathing room, so a crop sized exactly to the reported frame
+            // shaves the outer pixels — visible as tight, clipped edges on the
+            // wider modules. This capture is a one-shot for items that can never
+            // be photographed again, so erring generous is right: the draw path
+            // aspect-fits and centres, and `captureCropRect` clamps anything that
+            // would run off the composite.
+            let result = await self.axBoundsCapture(
+                items.map { (item: $0, bounds: $0.bounds.insetBy(dx: -2, dy: 0)) },
+                scale: scale,
+                displayID: displayID,
+                validateFreshBounds: false,
+                trustBounds: true
+            )
+            for (tag, image) in result.images {
+                self.images[tag] = image
+                self.preConcealWarmedTags.insert(tag)
+            }
+            MenuBarItemImageCache.diagLog.info(
+                "pre-conceal capture: stored \(result.images.count) of \(items.count) glyph(s)"
+            )
+            completion?()
+        }
+    }
+
     func updateCacheWithoutChecks(sections: [MenuBarSection.Name]) async {
         guard let appState else {
             MenuBarItemImageCache.diagLog.warning("updateCacheWithoutChecks: appState is nil, aborting")
@@ -2507,7 +2825,7 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
                 if newImages[tag] == nil,
                    let existing = images[tag],
                    !existing.isEffectivelyBlank,
-                   existing.scaledSize.width >= Self.minimumTrustedGlyphWidth
+                   true
                 {
                     retainedPriorCount += 1
                     continue
@@ -2666,10 +2984,17 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
     ) -> Bool {
         guard wouldAttemptCapture else { return false }
         guard let cachedImage, !cachedImage.isEffectivelyBlank else { return true }
-        // Recover from a native overflow chevron («») stored as a successful crop.
-        if cachedImage.scaledSize.width < Self.minimumTrustedGlyphWidth {
-            return true
-        }
+        // No width test here. It was meant to recover from a native overflow
+        // chevron («») stored as a successful crop, but the chevron is ~15 pt
+        // and iStat Menus' CPU-temperature glyph is 14 pt, so the two are not
+        // separable by width — and the consequence fell entirely on the real
+        // item. A legitimately narrow glyph was judged untrustworthy forever:
+        // every Thaw Bar open re-ran a reveal/capture pass (the bar visibly
+        // shuddering each time) and the freshly captured image was then dropped
+        // again by the same rule, so those icons never appeared in the bar at
+        // all. Chevron bleed is now rejected where the evidence actually exists
+        // — at capture time in `appendAXBoundsCrops`, which only applies the
+        // width rule when a native overflow control is really on screen.
         return false
     }
 
@@ -2875,13 +3200,23 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
                     ?? NSScreen.main?.backingScaleFactor
                     ?? 2
 
+                // Reveal every item that needs a photograph in ONE restriction
+                // change, and re-conceal them in one more. Previously this
+                // revealed and re-concealed per item, and since each of those is
+                // a whole-bar re-composite the cost was `2 × count` — a visible
+                // shudder every time the Thaw Bar opened. The old per-item
+                // comment justified it as protecting a dynamic-title neighbour
+                // (iStat) from flickering; in the configuration that matters
+                // iStat *is* the concealed group, so the per-item loop was
+                // causing far more flicker than it avoided.
+                let batchIdentifiers = itemsToCapture.map(\.uniqueIdentifier)
+                controller.revealItemsTemporarily(batchIdentifiers)
+                defer {
+                    controller.concealTemporarilyRevealedItems(batchIdentifiers)
+                }
+
                 for item in itemsToCapture {
                     guard !Task.isCancelled else { return }
-
-                    controller.revealItemTemporarily(item.uniqueIdentifier)
-                    defer {
-                        controller.concealTemporarilyRevealedItem(item.uniqueIdentifier)
-                    }
 
                     guard let liveItem = await self.waitForRevealedItem(
                         matching: item,
@@ -2910,8 +3245,7 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
                     )
                     for tag in captureResult.invalidatedTags {
                         if let existing = self.images[tag],
-                           !existing.isEffectivelyBlank,
-                           existing.scaledSize.width >= Self.minimumTrustedGlyphWidth
+                           !existing.isEffectivelyBlank
                         {
                             continue
                         }
@@ -2922,8 +3256,7 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
                         // Keep a settled glyph when the reveal/capture miss
                         // would otherwise wipe the Layout thumbnail.
                         if let existing = self.images[item.tag],
-                           !existing.isEffectivelyBlank,
-                           existing.scaledSize.width >= Self.minimumTrustedGlyphWidth
+                           !existing.isEffectivelyBlank
                         {
                             continue
                         }
@@ -3140,5 +3473,25 @@ final class MenuBarItemImageCache: ObservableObject, @unchecked Sendable {
         }
         MenuBarItemImageCache.diagLog.debug("cacheFailed(\(section.logString)): no cached images found for \(items.count) items in section (total cached images: \(images.count))")
         return true
+    }
+}
+
+
+/// Actor-independent storage for tags photographed before concealment.
+///
+/// Lives outside `MenuBarItemImageCache` because the capture path that must
+/// consult it is `nonisolated`, while the cache itself is `@MainActor`.
+nonisolated final class PreConcealWarmStore: @unchecked Sendable {
+    static let shared = PreConcealWarmStore()
+    private let lock = NSLock()
+    private var storage = Set<MenuBarItemTag>()
+
+    var tags: Set<MenuBarItemTag> {
+        get { lock.withLock { storage } }
+        set { lock.withLock { storage = newValue } }
+    }
+
+    func contains(_ tag: MenuBarItemTag) -> Bool {
+        lock.withLock { storage.contains(tag) }
     }
 }

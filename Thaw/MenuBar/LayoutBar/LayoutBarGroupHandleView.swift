@@ -12,7 +12,7 @@ import MenuBarModel
 
 /// A small grip drawn at the leading edge of a same-bundle cluster in the
 /// layout editor. Dragging the handle moves the whole group as one block,
-/// leaving the individual item views draggable on their own.
+/// while items in an expanded pocket can still be reordered inside it.
 ///
 /// The handle is deliberately *not* a `LayoutBarArrangedView`: it lives as a
 /// container-managed overlay in a reserved gap beside the cluster, so it never
@@ -89,15 +89,39 @@ final class LayoutBarGroupHandleView: NSView {
         }
     }
 
+    /// Set between mouse-down and the drag actually starting.
+    ///
+    /// AppKit only delivers `mouseDragged` while the pressed view is still in
+    /// the hierarchy, and `canSetArrangedViews` is not frozen until
+    /// `draggingSession(_:willBeginAt:)` — i.e. *after* the drag begins. Any
+    /// layout pass in that gap replaces this view and the drag silently never
+    /// starts, which is what "I can't even drag the group, it's almost like it
+    /// doesn't exist" looks like. `LayoutBarContainer.updateGroupHandles`
+    /// consults this and leaves a pressed handle alone.
+    private(set) var isTrackingPress = false
+
+    /// Temporary: proving whether the press reaches the grip at all.
+    private static let dragTraceLog = DiagLog(category: "DragTrace")
+
     override func mouseDown(with _: NSEvent) {
         // Swallow the mouse-down so the drag begins from this view.
+        isTrackingPress = true
+        Self.dragTraceLog.info("handle mouseDown: \(memberIdentifiers.count) member(s)")
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        isTrackingPress = false
     }
 
     override func mouseDragged(with event: NSEvent) {
         super.mouseDragged(with: event)
+        Self.dragTraceLog.info("handle mouseDragged: \(memberIdentifiers.count) member(s)")
         guard !memberIdentifiers.isEmpty else {
+            isTrackingPress = false
             return
         }
+        defer { isTrackingPress = false }
 
         let pasteboardItem = NSPasteboardItem()
         pasteboardItem.setString(

@@ -45,6 +45,15 @@ struct MenuBarLayoutSettingsPane: View {
                 LayoutBarsSection(itemManager: itemManager)
             }
 
+            if canArrangeLayout {
+                if #available(macOS 27, *) {
+                    LayoutItemGroupsSection(
+                        settings: appState.settings.advanced,
+                        itemManager: itemManager
+                    )
+                }
+            }
+
             LayoutSectionOptions(
                 settings: appState.settings.advanced,
                 isHidingUnavailable: isHidingUnavailable
@@ -262,6 +271,164 @@ private struct LayoutBarsSection: View {
         }
 
         await appState.imageCache.updateCacheWithoutChecks(sections: MenuBarSection.Name.allCases)
+    }
+}
+
+/// The "Item groups" editor.
+///
+/// Thaw already presents a multi-item app as one Layout cluster. A *group*
+/// makes that behavior explicit and can extend it across several apps:
+/// whatever the user adds moves and hides as one unit.
+///
+/// Membership is per **app**, matching the Add App UI. A bundle identifier is
+/// stable across relaunches, and every live item that app actually publishes
+/// is discovered dynamically, so this does not assume a particular iStat
+/// configuration.
+private struct LayoutItemGroupsSection: View {
+    @EnvironmentObject private var appState: AppState
+    @ObservedObject var settings: AdvancedSettings
+    @ObservedObject var itemManager: MenuBarItemManager
+
+    var body: some View {
+        // Resolved once per render and handed down. `candidates(in:)` walks the
+        // whole item cache, and this pane redraws on every cache update — a
+        // lookup per group row, per member row, would be dozens of walks a
+        // second while the icon previews tick.
+        let candidates = MenuBarItemGroupCoordinator.candidates(in: itemManager)
+        let claimed = Set(settings.itemGroups.flatMap(\.bundleIdentifiers))
+        // A group's claim is exclusive: an app in two groups would have to be
+        // in two places at once, so the picker never offers one twice.
+        let unclaimed = candidates.filter { !claimed.contains($0.bundleIdentifier) }
+        let names = Dictionary(
+            candidates.map { ($0.bundleIdentifier, $0.name) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        IceSection {
+            Text("Item groups")
+        } content: {
+            VStack(alignment: .leading, spacing: 16) {
+                if settings.itemGroups.isEmpty {
+                    Text("No groups yet. Create one to make several apps' menu bar items move and hide together.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach($settings.itemGroups) { $group in
+                        groupEditor(for: $group, unclaimed: unclaimed, names: names)
+                    }
+                }
+
+                HStack {
+                    Button("New Group") {
+                        settings.itemGroups.append(
+                            MenuBarItemGroup(name: String(localized: "New Group"))
+                        )
+                    }
+                    .buttonStyle(.settingsGlass)
+                    Spacer()
+                }
+
+                Text("Groups keep each app's native menu bar rendering and always move or hide together. Collapse only simplifies the group pocket shown in Layout.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func groupEditor(
+        for group: Binding<MenuBarItemGroup>,
+        unclaimed: [MenuBarItemGroupCoordinator.Candidate],
+        names: [String: String]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("Group name")
+                TextField("Group name", text: group.name)
+                    .textFieldStyle(.roundedBorder)
+                    .labelsHidden()
+                Button(group.wrappedValue.isCollapsed ? "Expand" : "Collapse") {
+                    toggleCollapse(group)
+                }
+                .buttonStyle(.settingsGlass)
+                .disabled(group.wrappedValue.bundleIdentifiers.count < 1)
+                Button("Ungroup") {
+                    ungroup(group)
+                }
+                .buttonStyle(.settingsGlass)
+            }
+
+            if group.wrappedValue.bundleIdentifiers.isEmpty {
+                Text("Add an app to this group.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(group.wrappedValue.bundleIdentifiers, id: \.self) { bundleIdentifier in
+                    HStack {
+                        // Falls back to the identifier: a group keeps naming an
+                        // app after it quits, and the row has to stay editable.
+                        Text(names[bundleIdentifier] ?? bundleIdentifier)
+                        Spacer()
+                        Button {
+                            removeMember(bundleIdentifier, from: group)
+                        } label: {
+                            Image(systemName: "minus.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Remove from group")
+                    }
+                }
+            }
+
+            Menu("Add App") {
+                if unclaimed.isEmpty {
+                    Text("Every app on the menu bar is already in a group")
+                } else {
+                    ForEach(unclaimed) { candidate in
+                        Button(candidate.name) {
+                            addMember(candidate.bundleIdentifier, to: group)
+                        }
+                    }
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Changes only the Layout pocket presentation. Native app rendering and
+    /// Visible/Hidden placement remain untouched.
+    private func toggleCollapse(_ group: Binding<MenuBarItemGroup>) {
+        group.wrappedValue.isCollapsed.toggle()
+    }
+
+    /// Adds an app and immediately repairs any pre-existing split so the new
+    /// group starts as one native placement unit.
+    private func addMember(_ bundleIdentifier: String, to group: Binding<MenuBarItemGroup>) {
+        group.wrappedValue.insert(bundleIdentifier)
+        guard let controller = appState.menuBarManager.sectionController else { return }
+        MenuBarItemGroupCoordinator.reconcileSections(
+            groups: [group.wrappedValue],
+            in: itemManager,
+            controller: controller
+        )
+    }
+
+    /// Removes an app from the group.
+    ///
+    /// Leaves every native item's authored section untouched.
+    private func removeMember(_ bundleIdentifier: String, from group: Binding<MenuBarItemGroup>) {
+        group.wrappedValue.remove(bundleIdentifier)
+    }
+
+    /// Deletes the group.
+    ///
+    /// Removing grouping must not move the native items between sections.
+    private func ungroup(_ group: Binding<MenuBarItemGroup>) {
+        let id = group.wrappedValue.id
+        settings.itemGroups.removeAll { $0.id == id }
     }
 }
 

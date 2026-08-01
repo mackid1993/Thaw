@@ -26,6 +26,16 @@ final class NotchIndicatorView: NSView {
 
     private let hosting: NSHostingView<NotchIndicatorContent>
 
+    /// The indicator is decoration, never a hit target.
+    ///
+    /// Its frame is derived from screen geometry, and when the preview's item
+    /// run outgrows the physical region (phantom items occupy preview space but
+    /// no real space) the overlay lands on top of real item views — which then
+    /// could not be clicked or dragged: "stuff under the notch area that I
+    /// can't access", 2026-08-01. Passing hit-tests through makes mispositioning
+    /// cosmetic instead of functional.
+    override func hitTest(_: NSPoint) -> NSView? { nil }
+
     init(averageColorInfo: MenuBarAverageColorInfo?) {
         self.averageColorInfo = averageColorInfo
         self.hosting = NSHostingView(rootView: NotchIndicatorContent(averageColorInfo: averageColorInfo))

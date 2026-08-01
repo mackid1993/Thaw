@@ -127,6 +127,12 @@ final class AdvancedSettings: ObservableObject {
     /// are included in the menu bar search panel.
     @Published var searchIncludeAlwaysHidden = Defaults.DefaultValue.searchIncludeAlwaysHidden
 
+    /// The user's menu bar item groups.
+    ///
+    /// A group makes the selected apps' native items move and hide as one unit.
+    /// See ``MenuBarItemGroup``.
+    @Published var itemGroups = [MenuBarItemGroup]()
+
     /// Storage for internal observers.
     private var cancellables = Set<AnyCancellable>()
 
@@ -173,6 +179,12 @@ final class AdvancedSettings: ObservableObject {
 
         Defaults.ifPresent(key: .searchSectionOrder) { (rawValues: [String]) in
             searchSectionOrder = Self.sanitizedSearchSectionOrder(from: rawValues)
+        }
+
+        if let data = Defaults.data(forKey: .menuBarItemGroups),
+           let decoded = try? JSONDecoder().decode([MenuBarItemGroup].self, from: data)
+        {
+            itemGroups = decoded
         }
     }
 
@@ -226,6 +238,14 @@ final class AdvancedSettings: ObservableObject {
             in: &c
         )
         $useLCSSortingOnNotchedDisplays.persistToDefaults(key: .useLCSSortingOnNotchedDisplays, in: &c)
+        // Encoded rather than stored as a plist array: the group model owns its
+        // own forward-compatible decoding, so one bad field can never take the
+        // user's whole group list with it.
+        $itemGroups.persistToDefaults(
+            key: .menuBarItemGroups,
+            transform: { (try? JSONEncoder().encode($0)) ?? Data("[]".utf8) },
+            in: &c
+        )
         $enableMenuBarItemOverflow.persistToDefaults(
             key: .enableMenuBarItemOverflow,
             sideEffect: { [weak self] _ in

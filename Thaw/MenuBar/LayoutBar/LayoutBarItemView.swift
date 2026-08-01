@@ -32,7 +32,25 @@ final class LayoutBarItemView: LayoutBarArrangedView {
     private var cancellables = Set<AnyCancellable>()
 
     /// The item that the view represents.
-    let item: MenuBarItem
+    ///
+    /// Mutable so the view can be **reused** across layout passes. It used to be
+    /// `let`, which forced `LayoutBarContainer`'s reuse test to compare whole
+    /// `MenuBarItem` values — and that comparison includes `title` and `bounds`.
+    /// A live item (iStat's CPU percentage, a network rate) changes both several
+    /// times a second, so the test never matched, every view was destroyed and
+    /// rebuilt on every cache publish, and the bar visibly gyrated. Reuse now
+    /// matches on identity and refreshes the payload here instead.
+    /// Swapping the payload must push a matching glyph immediately. The image
+    /// subscription only fires on the next `$images` emission, so without this
+    /// a reused view keeps showing its predecessor's icon until the cache next
+    /// publishes — which for a settled item can be a long time.
+    var item: MenuBarItem {
+        didSet {
+            guard oldValue.tag != item.tag else { return }
+            cachedImage = appState?.imageCache.image(for: item.tag)
+            tooltipController.text = item.displayName
+        }
+    }
 
     private lazy var tooltipController = CustomTooltipController(text: item.displayName, view: self)
     private var tooltipTrackingArea: NSTrackingArea?
@@ -177,10 +195,23 @@ final class LayoutBarItemView: LayoutBarArrangedView {
         var c = Set<AnyCancellable>()
 
         if let appState {
-            let tag = item.tag
+            // Resolve against the view's CURRENT tag on every emission.
+            //
+            // This used to capture `let tag = item.tag` once, at init. That was
+            // safe only while views were never reused: the old reuse test
+            // compared whole `MenuBarItem` values (title and bounds included),
+            // which never matched for a live item, so every pass built a fresh
+            // view with a fresh subscription. Reuse-by-identity broke that
+            // assumption and left the subscription pinned to the tag the view
+            // was born with — so a reused view kept drawing its predecessor's
+            // glyph (two items rendering byte-identical images), and a view
+            // pinned to a tag the cache had since dropped resolved to nil and
+            // fell back to the owning app's icon (all five iStat modules drawn
+            // as the iStat logo). Both symptoms, one frozen capture.
             let imageForTag = appState.imageCache.$images
-                .map { [weak appState] _ -> MenuBarItemImageCache.CapturedImage? in
-                    appState?.imageCache.image(for: tag)
+                .map { [weak self, weak appState] _ -> MenuBarItemImageCache.CapturedImage? in
+                    guard let self, let appState else { return nil }
+                    return appState.imageCache.image(for: self.item.tag)
                 }
 
             imageForTag
