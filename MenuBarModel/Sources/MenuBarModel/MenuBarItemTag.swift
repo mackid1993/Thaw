@@ -136,7 +136,23 @@ public struct MenuBarItemTag: Hashable, CustomStringConvertible, Sendable {
     /// while preserving Focus and Now Playing assignments.
     public static func isMenuBarAgentForcedVisibleIdentifier(_ identifier: String) -> Bool {
         let prefix = "\(Namespace.menuBarAgent.description):"
-        return identifier.hasPrefix(prefix) && !isPositionManageableMenuBarAgentIdentifier(identifier)
+        return identifier.hasPrefix(prefix)
+            && !isPositionManageableMenuBarAgentIdentifier(identifier)
+            && !isControlCenterGovernableIdentifier(identifier)
+    }
+
+    /// Identifier-level counterpart of ``isControlCenterGovernable``, for the
+    /// assignment-migration filter that runs before the live AX child exists.
+    ///
+    /// Without this the migration rejected Wi-Fi and its siblings on load — the
+    /// section controller logged `0 assigned item(s)` and the bar never changed —
+    /// so fixing only the live-tag policy was not enough to make these modules
+    /// assignable.
+    public static func isControlCenterGovernableIdentifier(_ identifier: String) -> Bool {
+        guard let separator = identifier.firstIndex(of: ":") else { return false }
+        let remainder = identifier[identifier.index(after: separator)...]
+        let title = remainder.prefix { $0 != ":" }
+        return SystemMenuBarModuleCatalog.controlCenterKeysByMenuExtraTitle[String(title)] != nil
     }
 
     /// iStat Menus status-item bundle ID. Titles and identifiers are
@@ -244,10 +260,26 @@ public struct MenuBarItemTag: Hashable, CustomStringConvertible, Sendable {
             return .excluded
         }
 
+        // ``isControlCenterGovernable`` must survive the MenuBarAgent clause, not
+        // just the non-MenuBarAgent one. On macOS 27 Apple's modules are children
+        // of MenuBarAgent, so Wi-Fi arrives as
+        // `com.apple.MenuBarAgent:com.apple.menuextra.wifi` and
+        // `isMenuBarAgentItemForcedVisible` returned true for it — forcing the
+        // very modules the Control Center carve-out was written for back to
+        // .forcedVisible before that carve-out was ever consulted. It sat behind
+        // `namespace != .menuBarAgent`, which is never satisfied for these items.
+        //
+        // The consequence was not cosmetic. These modules are the only things
+        // Thaw can hide *without* the assessment assertion — they go through
+        // Control Center's own per-host visibility preference and are stripped
+        // from the backend input entirely — and holding that assertion is what
+        // makes iStat Menus stop rendering. So the one hiding path that leaves a
+        // system monitor on the bar was unreachable from the layout UI: assigning
+        // Wi-Fi to Hidden logged `0 assigned item(s)` and nothing happened.
         if #available(macOS 27, *),
            isHidingUnsupported ||
            isLayoutAnchoredSystemItem ||
-           isMenuBarAgentItemForcedVisible ||
+           (isMenuBarAgentItemForcedVisible && !isControlCenterGovernable) ||
            (namespace != .menuBarAgent && isNonConcealableSystemItem && !isControlCenterGovernable)
         {
             return .forcedVisible

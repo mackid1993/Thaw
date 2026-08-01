@@ -2172,6 +2172,11 @@ final class MenuBarSectionController: ObservableObject {
             "items=\(itemComponent)",
             "system=\(experimentalSystemItemHiding)",
             "window=\(experimentalWindowHiding)",
+            // Collapsing a group changes what gets concealed without touching
+            // sectionAssignment, so without this the signature is unchanged and
+            // refresh() early-returns — the Layout preview updates and the bar
+            // does not. See `concealCollapsedGroups`.
+            "collapsed=\(collapsedGroupSignature)",
         ].joined(separator: "|")
     }
 
@@ -2724,7 +2729,72 @@ final class MenuBarSectionController: ObservableObject {
         {
             backendAssignment.removeValue(forKey: identifier)
         }
+        concealCollapsedGroups(in: &backendAssignment)
         return backendAssignment
+    }
+
+    /// Conceals every live member of a collapsed user group, whatever section
+    /// the member is assigned to.
+    ///
+    /// This is the real-menu-bar half of group collapse. `isCollapsed` has been
+    /// on ``MenuBarItemGroup`` and honoured by the Layout preview
+    /// (`LayoutBarContainer`, `LayoutBarPaddingView`) since groups were added,
+    /// but nothing applied it to the bar itself, so collapsing a group changed
+    /// the preview and nothing else.
+    ///
+    /// Why it matters here specifically: the assessment assertion's granularity
+    /// is the owner, not the item — "multiple items from the same bundle cannot
+    /// be hidden one by one" — so a bundle that publishes five status items is
+    /// all-or-nothing. A group is the unit that matches what macOS will actually
+    /// act on. Collapsing iStat Menus' group concealsits whole bundle in one
+    /// step, which returns roughly 230 pt to the trailing lane and takes the
+    /// native overflow chevron with it.
+    ///
+    /// Expanding is deliberately routed through the ordinary reveal path rather
+    /// than a per-group status item: those were tried, retired, and are actively
+    /// pruned (see ``pruneOrphanedControlItemKeys`` and the `Thaw.ItemGroup.`
+    /// prefix). Revealing removes these identifiers from the concealed set, and
+    /// when nothing else is concealed the assertion is released entirely — which
+    /// is the only condition under which iStat Menus renders at all. So a
+    /// collapsed group costs its glyphs and buys the chevron; expanding it puts
+    /// the live modules back on the bar.
+    /// Stable description of which groups are collapsed, for the refresh
+    /// signature.
+    private var collapsedGroupSignature: String {
+        guard let appState else { return "" }
+        return appState.settings.advanced.itemGroups
+            .filter(\.isCollapsed)
+            .flatMap(\.bundleIdentifiers)
+            .sorted()
+            .joined(separator: ",")
+    }
+
+    private func concealCollapsedGroups(in assignment: inout [String: MenuBarSection.Name]) {
+        guard let appState, revealedSection == nil else { return }
+        let collapsedBundles = Set(
+            appState.settings.advanced.itemGroups
+                .filter(\.isCollapsed)
+                .flatMap(\.bundleIdentifiers)
+        )
+        guard !collapsedBundles.isEmpty else { return }
+
+        var concealedCount = 0
+        for item in appState.itemManager.itemCache.managedItems where !item.isControlItem {
+            guard collapsedBundles.contains(item.tag.namespace.description),
+                  !temporarilyRevealedIDs.contains(item.uniqueIdentifier),
+                  assignment[item.uniqueIdentifier] != .alwaysHidden
+            else {
+                continue
+            }
+            assignment[item.uniqueIdentifier] = .hidden
+            concealedCount += 1
+        }
+        if concealedCount > 0 {
+            diagLog.debug(
+                "collapsed group(s) concealing \(concealedCount) item(s) "
+                    + "from \(collapsedBundles.count) bundle(s)"
+            )
+        }
     }
 
     private func assertionAssignmentInput() -> [String: MenuBarSection.Name] {
