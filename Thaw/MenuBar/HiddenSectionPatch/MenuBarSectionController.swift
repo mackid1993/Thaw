@@ -2439,6 +2439,14 @@ final class MenuBarSectionController: ObservableObject {
             ? backendAssignment
             : nil
 
+        // Publish stand-ins for items macOS allows but will not draw. Evaluated
+        // on every restriction change: when the last one lifts the originals
+        // draw again and every stand-in is removed in the same pass, so the bar
+        // never shows both. See ``CollateralItemProxy``.
+        if didChangeRestriction || collateralProxy?.isActive == true {
+            synchronizeCollateralProxies(allItems: allItems, hasConcealedItems: hasConcealedItems)
+        }
+
         if didChangeRestriction {
             appState.itemManager.noteRestrictionChange()
             restoreVisibleControlItemAfterRestrictionChange()
@@ -2749,6 +2757,10 @@ final class MenuBarSectionController: ObservableObject {
     }
 
     private func backendAssignmentInput() -> [String: MenuBarSection.Name] {
+        // A stand-in click suspends the entire restriction, not one item's
+        // concealment: a collateral-hidden item is suppressed by the assertion
+        // existing, so nothing short of releasing it puts the original on screen.
+        guard !isRestrictionSuspendedForProxyPress else { return [:] }
         var backendAssignment = effectiveAssignmentExcludingTemporarilyRevealed()
         for identifier in backendAssignment.keys
             where RuntimeModuleController.isGovernable(itemIdentifier: identifier)
@@ -2784,6 +2796,102 @@ final class MenuBarSectionController: ObservableObject {
     /// is the only condition under which iStat Menus renders at all. So a
     /// collapsed group costs its glyphs and buys the chevron; expanding it puts
     /// the live modules back on the bar.
+    /// Stand-ins for items macOS permits but refuses to draw.
+    private lazy var collateralProxy: CollateralItemProxy? = appState.map {
+        CollateralItemProxy(appState: $0)
+    }
+
+    /// Set while a stand-in click is being serviced. Suppresses the whole
+    /// restriction, not just one item's concealment.
+    private(set) var isRestrictionSuspendedForProxyPress = false
+    private var proxyPressTask: Task<Void, Never>?
+
+    /// Opens the real menu behind a stand-in.
+    ///
+    /// An AX press on an undrawn element is matched but does nothing — the menu
+    /// has nowhere to open, which the log shows as "matched by canonical title"
+    /// immediately followed by a failed press. The item has to be on screen
+    /// first, and for a collateral-hidden item "on screen" means no restriction
+    /// held at all, since it is the restriction's existence rather than its
+    /// contents that suppresses the draw.
+    ///
+    /// So: lift the restriction, let the original draw, press it, then re-apply
+    /// once the menu is dismissed. The stand-ins tear themselves down while the
+    /// original is drawn and come back with it, so the bar never shows both.
+    func openMenuBehindProxy(_ item: MenuBarItem) {
+        proxyPressTask?.cancel()
+        isRestrictionSuspendedForProxyPress = true
+        lastRefreshSignature = nil
+        refresh()
+
+        proxyPressTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Give MenuBarAgent a beat to redraw before pressing.
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            self.appState?.itemManager.showMenuForProxiedItem(item)
+
+            // Hold the restriction off for as long as the menu is open, then
+            // settle briefly so a re-apply does not race the dismissal.
+            var idleSince = Date()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                let isOpen = await self.appState?.itemManager.isAnyMenuBarItemMenuOpen() ?? false
+                if isOpen {
+                    idleSince = Date()
+                } else if Date().timeIntervalSince(idleSince) >= 1.5 {
+                    break
+                }
+            }
+            self.isRestrictionSuspendedForProxyPress = false
+            self.lastRefreshSignature = nil
+            self.refresh()
+        }
+    }
+
+    /// Finds items that are neither concealed by Thaw nor drawn by macOS, and
+    /// keeps a stand-in published for exactly those.
+    ///
+    /// Ground truth is a fresh screenshot (``itemsRenderingBlank``), not the
+    /// item's own claims: a collateral-hidden item still reports `isOnScreen ==
+    /// true` and plausible bounds, so nothing about its own state distinguishes
+    /// it from a drawn one. The candidate set is deliberately every non-concealed
+    /// item rather than a list of known-affected apps — whichever items the OS
+    /// declines to draw are the ones stood in for, whoever owns them.
+    private func synchronizeCollateralProxies(allItems: [MenuBarItem], hasConcealedItems: Bool) {
+        guard let collateralProxy, let appState else { return }
+        // Off by default. The stand-ins are a diagnostic, not a feature: they
+        // proved the data stays live while the originals are undrawn, and they
+        // are not a faithful substitute for the originals themselves.
+        guard UserDefaults.standard.bool(forKey: "ThawEnableCollateralProxies") else {
+            collateralProxy.teardown()
+            return
+        }
+        guard #available(macOS 27, *), hasConcealedItems else {
+            collateralProxy.teardown()
+            return
+        }
+
+        let concealed = assertionConcealedIdentifiers
+        let candidates = allItems.filter { item in
+            !item.isControlItem
+                && !concealed.contains(item.uniqueIdentifier)
+                && !item.tag.isNativeOverflowPlaceholder
+        }
+        guard !candidates.isEmpty else {
+            collateralProxy.teardown()
+            return
+        }
+
+        let displayID = NSScreen.main?.displayID ?? CGMainDisplayID()
+        let cache = appState.imageCache
+        Task { @MainActor in
+            let blank = await cache.itemsRenderingBlank(among: candidates, displayID: displayID)
+            let undrawn = candidates.filter { blank.contains($0.tag) }
+            collateralProxy.synchronize(with: undrawn)
+        }
+    }
+
     /// Stable description of which groups are collapsed, for the refresh
     /// signature.
     private var collapsedGroupSignature: String {

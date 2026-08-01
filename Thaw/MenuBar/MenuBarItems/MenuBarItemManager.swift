@@ -5215,6 +5215,24 @@ extension MenuBarItemManager {
         return FileManager.default.fileExists(atPath: electronFramework.path)
     }
 
+    /// Opens the menu of an item Thaw is publishing a stand-in for.
+    ///
+    /// Entry point for ``CollateralItemProxy``. The original is undrawn only as
+    /// collateral — never concealed by Thaw — which is precisely the case
+    /// ``pressItemViaAccessibility`` documents as pressable in place, so this is
+    /// an AX press on the real element rather than a synthesized click. No
+    /// cursor is moved and nothing is revealed or relaunched.
+    @discardableResult
+    func showMenuForProxiedItem(_ item: MenuBarItem) -> Bool {
+        let opened = pressItemViaAccessibility(item)
+        if !opened {
+            MenuBarItemManager.diagLog.error(
+                "stand-in press failed for \(item.logString); the element could not be resolved"
+            )
+        }
+        return opened
+    }
+
     /// Attempts to open the item's menu by performing an Accessibility press on
     /// its status item element. Returns false (so the caller can fall back to
     /// a synthetic click) when the element cannot be resolved or the press fails.
