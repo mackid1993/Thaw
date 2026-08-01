@@ -355,9 +355,22 @@ final class MenuBarSectionController: ObservableObject {
         // `readPositions` closure below), so the translation reaches the
         // key resolution that actually matters.
         let positionStore = NamespaceAliasingPreferenceStore(wrapping: rawPositionStore)
+        // `ThawUseNativeAssertion` swaps in an allowlist Thaw builds itself, so
+        // apps macOS files under a process name rather than a bundle identifier
+        // (iStat Menus) are named on it in the spelling MenuBarAgent actually
+        // looks up. See ``ThawAssessmentSessionController``. Opt-in: a bad
+        // allowlist means an empty menu bar, so the default stays on the shipped
+        // PlatformRuntimeKit path.
+        let backend: any RuntimeSessionControllering = if UserDefaults.standard
+            .bool(forKey: "ThawUseNativeAssertion")
+        {
+            ThawAssessmentSessionController()
+        } else {
+            RuntimeSessionController()
+        }
         self.init(
             appState: appState,
-            backend: RuntimeSessionController(),
+            backend: backend,
             ccModuleManager: RuntimeModuleController(),
             cgsWindowHider: RuntimeWindowController(),
             axItemHider: AXItemHider(),
