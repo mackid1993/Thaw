@@ -993,6 +993,40 @@ final class MenuBarSectionController: ObservableObject {
         UserDefaults.standard.set(raw, forKey: Self.orderKey)
     }
 
+    /// Absorbs a live, externally observed item order into the section model.
+    ///
+    /// ``sectionItemOrder`` is read out of defaults exactly once, by
+    /// ``loadOrder(defaults:)`` in `init`; every later mutation is Thaw's own
+    /// (`setSectionOrder`, `setSection`, `resetAssignment`, `applyProfileLayout`).
+    /// Nothing ever re-read the key. Meanwhile `MenuBarItemManager`'s cache pass
+    /// writes the *same* key with the order it derives from the live AX
+    /// enumeration, which is how a ⌘-drag made directly in the menu bar gets
+    /// absorbed. One key, two writers, one init-only reader — and `persistOrder()`
+    /// then wrote this stale model back over the manager's fresh mirror.
+    ///
+    /// The visible result was a drag that survived on screen but was reverted in
+    /// the model, which is the model that decides automatic overflow ejection
+    /// (`rebalanceMacOS27OverflowIfNeeded` ranks by `sectionItemOrder[.visible]`,
+    /// and a recorded rank beats live geometry) and group section reconciliation.
+    /// Reported as: moving an item with ⌘ leaves it outside its group, while
+    /// moving the same item inside Thaw keeps it in the group.
+    ///
+    /// Deliberately does not persist. The caller has already written this exact
+    /// order to ``orderKey``; writing again here would re-enter `persistOrder()`
+    /// on every cache pass.
+    func absorbObservedSectionOrder(_ observed: [String: [String]]) {
+        var canonical = [MenuBarSection.Name: [String]]()
+        for (rawKey, identifiers) in observed {
+            guard let section = MenuBarSection.Name(rawValue: rawKey) else { continue }
+            canonical[section] = MenuBarItemTag.canonicalPersistentIdentifiers(identifiers)
+        }
+        guard canonical != sectionItemOrder else { return }
+        sectionItemOrder = canonical
+        diagLog.debug(
+            "absorbed externally observed section order: \(canonical.mapValues(\.count))"
+        )
+    }
+
     /// Returns the temporary reveal target for a section control.
     ///
     /// The Visible control item is the user-facing Thaw icon; like Ice on macOS
@@ -1244,11 +1278,54 @@ final class MenuBarSectionController: ObservableObject {
     /// drag) and persists it. The caller is expected to trigger a recache so the
     /// layout bars re-render in the new order.
     func setSectionOrder(_ identifiers: [String], for section: MenuBarSection.Name) {
-        let identifiers = MenuBarItemTag.canonicalPersistentIdentifiers(identifiers)
-        sectionItemOrder[section] = identifiers
+        let incoming = MenuBarItemTag.canonicalPersistentIdentifiers(identifiers)
+        let merged = mergingUnrepresentedIdentifiers(into: incoming, for: section)
+        sectionItemOrder[section] = merged
         persistOrder()
-        appState?.itemManager.mirrorMacOS27SectionOrder(identifiers, for: section)
-        diagLog.info("setSectionOrder(\(section.rawValue)); \(identifiers.count) item(s)")
+        appState?.itemManager.mirrorMacOS27SectionOrder(merged, for: section)
+        if merged.count != incoming.count {
+            diagLog.info(
+                "setSectionOrder(\(section.rawValue)); \(incoming.count) item(s) from the layout bar, "
+                    + "\(merged.count - incoming.count) preserved that it could not draw"
+            )
+        } else {
+            diagLog.info("setSectionOrder(\(section.rawValue)); \(incoming.count) item(s)")
+        }
+    }
+
+    /// Re-inserts identifiers the layout bar did not represent but which the
+    /// assignment model still places in this section.
+    ///
+    /// A layout-bar drop commits *the views it rendered* as the section's entire
+    /// order. Any item it could not draw — a phantom whose glyph capture was
+    /// rejected, a view not yet built — is therefore erased from the persisted
+    /// order by an unrelated drag. Observed 2026-08-01: a ⌘-drag was absorbed
+    /// correctly at 20 visible items, then the next layout-bar commit wrote 16
+    /// and the four undrawn items lost their place.
+    ///
+    /// Only identifiers whose ``section(for:)`` still resolves to this section
+    /// are restored, so an item the user genuinely moved elsewhere is not
+    /// resurrected: by the time the destination's `setSection` has run, its
+    /// assignment no longer names this section. Each survivor is re-inserted at
+    /// the index it previously held, clamped to the merged array.
+    private func mergingUnrepresentedIdentifiers(
+        into incoming: [String],
+        for section: MenuBarSection.Name
+    ) -> [String] {
+        guard let previous = sectionItemOrder[section], !previous.isEmpty else {
+            return incoming
+        }
+        let incomingSet = Set(incoming)
+        var merged = incoming
+        for (index, identifier) in previous.enumerated() {
+            guard !incomingSet.contains(identifier),
+                  self.section(for: identifier) == section
+            else {
+                continue
+            }
+            merged.insert(identifier, at: min(index, merged.count))
+        }
+        return merged
     }
 
     /// Records a section order from live layout items, dropping structural

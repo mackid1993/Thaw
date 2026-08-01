@@ -772,10 +772,12 @@ final class MenuBarItemManager: ObservableObject {
         for section: MenuBarSection.Name
     ) {
         guard !MenuBarBackendProvider.current.supportsLegacySectionHiding else { return }
-        // On macOS 27 MenuBarSectionController.persistOrder() is the single writer to
-        // "MenuBarItemManager.savedSectionOrder" defaults; this method only
-        // keeps the in-memory dict in sync so LayoutSolver reads fresh data
-        // without waiting for the next cache-cycle mirror.
+        // On macOS 27 there are two writers to "MenuBarItemManager.savedSectionOrder"
+        // defaults: MenuBarSectionController.persistOrder() and the
+        // .mirrorSectionOrder branch of the cache pass. (This comment used to
+        // claim persistOrder was the only one, which is what let the two drift.)
+        // This method only keeps the in-memory dict in sync so LayoutSolver reads
+        // fresh data without waiting for the next cache-cycle mirror.
         let key = sectionKey(for: section)
         if identifiers.isEmpty {
             savedSectionOrder.removeValue(forKey: key)
@@ -2159,6 +2161,13 @@ extension MenuBarItemManager {
                     "Mirrored macOS 27 section order: \(mirrored.mapValues(\.count))"
                 )
             }
+            // Close the read loop. The mirror above absorbs an order the user
+            // made outside Thaw — a ⌘-drag in the menu bar itself — but
+            // MenuBarSectionController reads this key only in its initializer,
+            // so without this its model keeps the pre-drag order and
+            // persistOrder() writes it back over the line above. See
+            // MenuBarSectionController.absorbObservedSectionOrder.
+            appState?.menuBarManager.sectionController?.absorbObservedSectionOrder(mirrored)
         case .saveSpatialOrder:
             // Don't persist if any items are in a transient blocked state (x=-1).
             // Wait for the next cache cycle when bounds are reliable.
